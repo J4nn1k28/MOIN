@@ -48,8 +48,24 @@
         .view-section { position: absolute; top: 0; left: 0; width: 100%; height: calc(100% - var(--nav-height)); display: none; overflow-y: auto; padding-bottom: 20px; }
         .view-section.active { display: block; }
         #view-map { padding: 0; overflow: hidden; }
-        #map-wrapper { width: 100%; height: 100%; overflow: hidden; background: #050505; }
-        #map { width: 100%; height: 100%; transition: transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1); }
+       #map-wrapper { 
+    position: relative; 
+    width: 100%; 
+    height: 100%; 
+    overflow: hidden; 
+    background: #050505; 
+}
+
+#map { 
+    position: absolute; 
+    top: 50%; 
+    left: 50%; 
+    width: 150vmax;  /* Sorgt dafür, dass die Karte diagonal alles ausfüllt */
+    height: 150vmax; 
+    /* Wichtig: translate zentriert die Karte erst, bevor sie rotiert wird */
+    transform: translate(-50%, -50%) rotate(0deg); 
+    transition: transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1); 
+}
 
         /* HUD */
         #nav-hud {
@@ -11350,7 +11366,7 @@ function buildGraph() {
         map.getContainer().style.cursor = 'crosshair';
         autoCenter = false; 
         document.getElementById('btn-center').classList.remove('active');
-        document.getElementById('map').style.transform = `rotate(0deg)`;
+        document.getElementById('map').style.transform = `translate(-50%, -50%) rotate(0deg)`;
     }
 
     function cancelNavSetup() {
@@ -11442,7 +11458,7 @@ function buildGraph() {
         routeLayer.clearLayers();
         autoCenter = false;
         document.getElementById('btn-center').classList.remove('active');
-        document.getElementById('map').style.transform = `rotate(0deg)`;
+        document.getElementById('map').style.transform = `translate(-50%, -50%) rotate(0deg)`;
         map.getContainer().style.cursor = '';
     }
 
@@ -11454,7 +11470,7 @@ function buildGraph() {
             if(myPos) map.setView(myPos, map.getZoom());
         } else {
             btn.classList.remove('active');
-            document.getElementById('map').style.transform = `rotate(0deg)`;
+            document.getElementById('map').style.transform = `translate(-50%, -50%) rotate(0deg)`;
         }
     }
 
@@ -11463,7 +11479,7 @@ function buildGraph() {
         if(myPos && navMode && autoCenter) {
             const mapEl = document.getElementById('map');
             mapEl.style.transformOrigin = "center center";
-            mapEl.style.transform = `rotate(-${boatHeading}deg)`;
+            mapEl.style.transform = `translate(-50%, -50%) rotate(-${boatHeading}deg)`;
             
             let z = 14;
             if(currentSpeed < 5) z=16;
@@ -11497,15 +11513,52 @@ function buildGraph() {
 
 
         // Next WP Logic
-        if(distToWp < 80) { 
-             nextWpIndex++;
-             if(nextWpIndex >= navPath.length) {
-                 document.getElementById('turn-text').innerText = "ZIEL ERREICHT";
-                 document.getElementById('turn-arrow').innerText = "🏁";
-                 document.getElementById('turn-street').innerText = "";
-                 return;
-             }
+
+        // Neuer Code: Ersetzt den alten if-Block komplett
+        let advanced = false;
+                
+        // 1. Großzügiger Hit-Radius (100m)
+        if(distToWp < 100) {
+            advanced = true;
+        } 
+        // 2. Querab-Prüfung: Haben wir den Waypoint passiert?
+        else if (nextWpIndex > 0) {
+            const prevWp = navPath[nextWpIndex - 1];
+            const currentWp = navPath[nextWpIndex];
+            
+            // Geplante Peilung des aktuellen Streckenabschnitts
+            const bearingSegment = L.GeometryUtil.bearing(prevWp, currentWp);
+            // Tatsächliche Peilung vom Boot zum Waypoint
+            const bearingToWp = L.GeometryUtil.bearing(myPos, currentWp);
+            
+            // Abweichung berechnen
+            let diff = Math.abs((bearingSegment - bearingToWp + 360) % 360);
+            if (diff > 180) diff = 360 - diff;
+            
+            if (diff > 90 && distToWp < 400) {
+                advanced = true;
+            }
         }
+
+        // 3. Fallback: Ist der übernächste Punkt schon näher als der aktuelle?
+        if (!advanced && nextWpIndex + 1 < navPath.length) {
+            const distToNextNext = map.distance(myPos, navPath[nextWpIndex + 1]);
+            if (distToNextNext < distToWp) {
+                advanced = true;
+            }
+        }
+
+        // Wegpunkt erfolgreich passiert -> zum nächsten schalten
+        if(advanced) {
+            nextWpIndex++;
+            if(nextWpIndex >= navPath.length) {
+                document.getElementById('turn-text').innerText = "ZIEL ERREICHT";
+                document.getElementById('turn-arrow').innerText = "🏁";
+                document.getElementById('turn-street').innerText = "";
+                return;
+            }
+        }
+        
         
         document.getElementById('turn-dist').innerText = Math.round(distToWp) + " m";
         
