@@ -10802,23 +10802,53 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
         });
         
         // ... (Dein GPS Code bleibt gleich) ...
-        if (navigator.geolocation) {
-            navigator.geolocation.watchPosition(
-                (pos) => {
-                    myPos = L.latLng(pos.coords.latitude, pos.coords.longitude);
-                    if(pos.coords.speed !== null) currentSpeed = pos.coords.speed * 1.94384; 
-                    if(pos.coords.heading !== null && !isNaN(pos.coords.heading)) boatHeading = pos.coords.heading;
-                    drawBoat();
-                    if(autoCenter) {
-                        map.panTo(myPos, {animate: true});
+       if (navigator.geolocation) {
+        navigator.geolocation.watchPosition(
+            (pos) => {
+                myPos = L.latLng(pos.coords.latitude, pos.coords.longitude);
+                if(pos.coords.speed !== null) currentSpeed = pos.coords.speed * 1.94384;
+                if(pos.coords.heading !== null && !isNaN(pos.coords.heading)) boatHeading = pos.coords.heading;
+                
+                drawBoat();
+
+                // HIER IST DIE NEUE LOGIK:
+                // Update wird nur ausgeführt, wenn tatsächlich ein neues GPS-Signal reinkommt!
+                if(autoCenter) {
+                    // Zoom Level anhand der Geschwindigkeit anpassen
+                    let z = 14;
+                    if(currentSpeed < 5) z=16;
+                    else if(currentSpeed < 15) z=15;
+                    
+                    if(map.getZoom() !== z) {
+                        map.setZoom(z, {animate: true});
                     }
-                },
-                (err) => { console.error("GPS Error", err); },
-                { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }
-            );
-        } else {
-            showSysMsg("Dein Browser unterstützt kein GPS.", "FEHLER");
-        }
+                    
+                    // Karte zentrieren
+                    map.panTo(myPos, {animate: true});
+
+                    // Karte in Fahrtrichtung rotieren
+                    const mapEl = document.getElementById('map');
+                    mapEl.style.transformOrigin = "center center";
+                    mapEl.style.transform = `translate(-50%, -50%) rotate(-${boatHeading}deg)`;
+                }
+
+                // Navigations-HUD nur aktualisieren, wenn wir neue Geodaten haben
+                if(navMode) {
+                    updateNavState();
+                }
+            },
+            (err) => {
+                console.error("GPS Error", err);
+            },
+            {
+                enableHighAccuracy: true,
+                maximumAge: 0,
+                timeout: 5000
+            }
+        );
+    } else {
+        showSysMsg("Dein Browser unterstützt kein GPS.", "FEHLER");
+    }
     }
     
 let lockOverrides = {};
@@ -11498,23 +11528,7 @@ function buildGraph() {
     }
 }
 
-    // --- VISUAL LOOP ---
-    function mainLoop() {
-        if(myPos && navMode && autoCenter) {
-            const mapEl = document.getElementById('map');
-            mapEl.style.transformOrigin = "center center";
-            mapEl.style.transform = `translate(-50%, -50%) rotate(-${boatHeading}deg)`;
-            
-            let z = 14;
-            if(currentSpeed < 5) z=16;
-            else if(currentSpeed < 15) z=15;
-            
-            if(map.getZoom() !== z) map.setZoom(z, {animate:false});
-            map.panTo(myPos, {animate: false});
-            updateNavState();
-        }
-        requestAnimationFrame(mainLoop);
-    }
+    
     
     function updateNavState() {
         if(navPath.length === 0 || nextWpIndex >= navPath.length) return;
