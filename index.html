@@ -64,7 +64,6 @@
     height: 150vmax; 
     /* Wichtig: translate zentriert die Karte erst, bevor sie rotiert wird */
     transform: translate(-50%, -50%) rotate(0deg); 
-    transition: transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1); 
 }
 
         /* HUD */
@@ -276,6 +275,21 @@
                 </div>
                 <div id="tide-count" style="margin-top:10px; text-align:center; color:var(--dim); font-size:0.9em;"></div>
             </div>
+            <div class="panel-section">
+    <div class="section-title">
+        <span><i class="fa-solid fa-chart-line"></i> Pegelverlauf (St. Pauli)</span>
+        <span id="pegel-current-val" class="badge">Lade...</span>
+    </div>
+    
+    <div id="pegel-diagram-container" style="width: 100%; height: 200px; margin-top: 10px; position: relative;">
+        <svg id="pegel-svg" width="100%" height="100%" viewBox="0 0 500 200" preserveAspectRatio="none">
+            </svg>
+    </div>
+    <div id="pegel-time-labels" style="display: flex; justify-content: space-between; font-size: 11px; color: #88a3b9; margin-top: 4px; font-family: 'JetBrains Mono', monospace;">
+        <span id="pegel-start-time">--:--</span>
+        <span id="pegel-end-time">--:--</span>
+    </div>
+</div>
         </div>
     </div>
 
@@ -11463,16 +11477,26 @@ function buildGraph() {
     }
 
     function toggleAutoCenter() {
-        autoCenter = !autoCenter;
-        const btn = document.getElementById('btn-center');
-        if(autoCenter) {
-            btn.classList.add('active');
-            if(myPos) map.setView(myPos, map.getZoom());
-        } else {
-            btn.classList.remove('active');
-            document.getElementById('map').style.transform = `translate(-50%, -50%) rotate(0deg)`;
-        }
+    autoCenter = !autoCenter;
+    const btn = document.getElementById('btn-center');
+    const mapEl = document.getElementById('map');
+    
+    if(autoCenter) {
+        btn.classList.add('active');
+        
+        // Sanfte Drehung bei automatischer GPS-Navigation wieder erlauben
+        mapEl.style.transition = 'transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1)';
+        
+        if(myPos) map.setView(myPos, map.getZoom());
+    } else {
+        btn.classList.remove('active');
+        
+        // WICHTIG: Animation hart abschalten, bevor die Rotation resettet wird!
+        // Das verhindert das Berechnungschaos und den Memory-Crash beim Draggen.
+        mapEl.style.transition = 'none'; 
+        mapEl.style.transform = `translate(-50%, -50%) rotate(0deg)`;
     }
+}
 
     // --- VISUAL LOOP ---
     function mainLoop() {
@@ -11658,6 +11682,85 @@ function buildGraph() {
         }
         updateTiefstack();
     }
+
+    async function loadPegelData() {
+    const pegelNummer = "5952050"; // St. Pauli
+    const apiUrl = `https://www.pegelonline.wsv.de/webservices/rest-api/v2/gewaesser/ELBE/pegel/HAMBURG%20ST.%20PAULI/messwerte.json?start=P1D`;
+
+    try {
+        const response = await fetch(apiUrl);
+        if (!response.ok) throw new Error("Fehler beim Laden der Pegeldaten");
+        const data = await response.json();
+
+        if (!data || data.length === 0) return;
+
+        // Aktuellen Wert oben rechts anzeigen
+        const latest = data[data.length - 1];
+        document.getElementById('pegel-current-val').innerText = `${latest.value} cm`;
+
+        // Zeitstempel für die Achsen-Beschriftung extrahieren
+        const startTimeStr = new Date(data[0].timestamp).toLocaleTimeString('de-DE', {hour: '2-digit', minute:'2-digit'});
+        const endTimeStr = new Date(latest.timestamp).toLocaleTimeString('de-DE', {hour: '2-digit', minute:'2-digit'});
+        document.getElementById('pegel-start-time').innerText = startTimeStr;
+        document.getElementById('pegel-end-time').innerText = endTimeStr;
+
+        // Werte für die Skalierung ermitteln
+        const values = data.map(d => d.value);
+        const minVal = Math.min(...values) - 20; // 20cm Puffer nach unten
+        const maxVal = Math.max(...values) + 20; // 20cm Puffer nach oben
+        const valRange = maxVal - minVal;
+
+        // SVG Dimensionen (müssen mit viewBox übereinstimmen)
+        const svgWidth = 500;
+        const svgHeight = 200;
+        const paddingBottom = 20;
+        const paddingTop = 10;
+        const chartHeight = svgHeight - paddingTop - paddingBottom;
+
+        // Punkte für die SVG-Linie berechnen
+        let points = "";
+        let fillPoints = `0,${svgHeight} `; // Startpunkt für die Flächenfüllung
+
+        data.forEach((d, index) => {
+            const x = (index / (data.length - 1)) * svgWidth;
+            // Y-Achse ist im SVG invertiert (0 ist oben)
+            const y = svgHeight - paddingBottom - ((d.value - minVal) / valRange) * chartHeight;
+            
+            points += `${x},${y} `;
+            fillPoints += `${x},${y} `;
+        });
+
+        fillPoints += `${svgWidth},${svgHeight}`;
+
+        // SVG Inhalt dynamisch zusammenbauen
+        const svg = document.getElementById('pegel-svg');
+        svg.innerHTML = `
+            <line x1="0" y1="${paddingTop}" x2="${svgWidth}" y2="${paddingTop}" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4"/>
+            <line x1="0" y1="${svgHeight - paddingBottom}" x2="${svgWidth}" y2="${svgHeight - paddingBottom}" stroke="rgba(255,255,255,0.1)"/>
+            
+            <text x="5" y="${paddingTop + 12}" fill="#6b7280" font-size="10" font-family="monospace">${Math.round(maxVal - 20)} cm</text>
+            <text x="5" y="${svgHeight - paddingBottom - 4}" fill="#6b7280" font-size="10" font-family="monospace">${Math.round(minVal + 20)} cm</text>
+
+            <defs>
+                <linearGradient id="pegel-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+                    <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.25" />
+                    <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.0" />
+                </linearGradient>
+            </defs>
+
+            <polygon points="${fillPoints}" fill="url(#pegel-grad)" />
+
+            <polyline points="${points}" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        `;
+
+    } catch (error) {
+        console.error("Pegel-Fehler:", error);
+        document.getElementById('pegel-current-val').innerText = "Fehler";
+    }
+}
+
+// Optional: Automatisch alle 5 Minuten aktualisieren
+setInterval(loadPegelData, 5 * 60 * 1000);
     
     function drawCurrents() {
         currentLayer.clearLayers();
