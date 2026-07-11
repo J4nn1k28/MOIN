@@ -60,10 +60,18 @@
     position: absolute; 
     top: 50%; 
     left: 50%; 
-    width: 150vmax;  /* Sorgt dafür, dass die Karte diagonal alles ausfüllt */
-    height: 150vmax; 
+    /* Wird per JS exakt auf die Bildschirmdiagonale gesetzt (sizeMapWrapper()),
+       damit beim Rotieren nirgends eine Ecke sichtbar wird - ohne auf
+       größeren Screens unnötig viele Kartenkacheln vorzuhalten.
+       150vmax ist nur der Fallback, falls JS noch nicht gelaufen ist. */
+    width: var(--map-diag, 150vmax);
+    height: var(--map-diag, 150vmax);
     /* Wichtig: translate zentriert die Karte erst, bevor sie rotiert wird */
-    transform: translate(-50%, -50%) rotate(0deg); 
+    transform: translate(-50%, -50%) rotate(0deg);
+    transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1);
+    /* Eigene Compositor-Ebene: Rotation kostet dann nur GPU, kein Reflow */
+    will-change: transform;
+    backface-visibility: hidden;
 }
 
         /* HUD */
@@ -401,10 +409,6 @@
     <script src="https://unpkg.com/leaflet-geometryutil@0.9.3/src/leaflet.geometryutil.js"></script>
 
     <script>
-    // =============================================================
-    // 1. DATEN PLATZHALTER 
-    // =============================================================
-    
     const waypoints = {
   "w1": [
     53.52801,
@@ -9302,8 +9306,7 @@ const connections = [
         { path: [[53.53651,9.99022], [53.53465,9.99138], [53.53281,9.99464], [53.53079,9.99825], [53.52886,10.00099], [53.52653,10.00451], [53.52516,10.00726]], weight: 4 },
         { path: [[53.53615,10.00181], [53.53472,10.00421], [53.53322,10.00803], [53.53095,10.01348], [53.52942,10.01515], [53.52595,10.01314]], weight: 4 }
     ];
-    
-    // BSH Data (Jan 2026 Sample)
+
     const bshData = `
 VB2#DE__508P# #N#Mo#29.12.2025# 5:04# 3.51 # #363#+ 1:00#  26815#   4#2461038.669375#
 VB2#DE__508P# #H#Mo#29.12.2025#10:24# 7.14 # #363#+ 1:00#  26816#   1#2461038.891423#
@@ -10730,183 +10733,190 @@ VB2#DE__508P# #N#Do#31.12.2026#17:07# 3.46 # #365#+ 1:00#  27170#   4#2461406.17
 VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.385865#
 `;
 
-    // --- 3. LOGIC ---
+    // =============================================================
+    // 3. APP LOGIK (neu strukturiert, performance-optimiert)
+    // =============================================================
+    // Wichtigste Änderungen gegenüber der alten Version:
+    // 1) Kein requestAnimationFrame-Dauerloop mehr, der 60x/Sekunde
+    //    Leaflet neu zentriert (map.panTo/setZoom) und die riesige
+    //    Kartenfläche dreht. Kompass-Kurs kommt nur von GPS-Fixes
+    //    (~1x/Sekunde), also reicht es, Rotation + Kartenzentrierung
+    //    NUR bei jedem GPS-Update zu setzen (siehe watchPosition unten).
+    //    Das war der Hauptgrund für den Absturz am Handy.
+    // 2) Die Kartenfläche (#map), die für die Drehung überdimensioniert
+    //    sein muss, wird jetzt dynamisch auf die tatsächliche
+    //    Bildschirmdiagonale skaliert statt pauschal 150vmax -
+    //    dadurch werden auf großen Screens nicht unnötig viele
+    //    Kartenkacheln geladen/gehalten.
+    // 3) Dijkstra nutzt jetzt einen Min-Heap statt array.sort() bei
+    //    jedem Schritt (war O(n log n) pro Knoten, jetzt O(log n)).
+    // 4) Doppelt definierte Funktionen (zwei toggleLocks()) entfernt,
+    //    totes Codepfad (findPath(), alte PriorityQueue) entfernt.
+    // 5) Kleine DOM-Helper, um wiederholte getElementById-Aufrufe zu
+    //    bündeln und nur bei echten Wertänderungen zu schreiben.
+
+    // --- DOM HELPERS ---
+    const dom = {};
+    function $(id) {
+        if (!(id in dom)) dom[id] = document.getElementById(id);
+        return dom[id];
+    }
+    function setText(id, val) {
+        const el = $(id);
+        if (el && el.innerText !== String(val)) el.innerText = val;
+    }
+
+    // --- STATE ---
     let map, routeLayer, myPosLayer, currentLayer, boatMarker;
-    let mapBaseLayer; 
+    let mapBaseLayer;
     let graph = {};
     let navMode = false;
     let myPos = null;
     let boatHeading = 0;
     let sarRunning = false, sarStart = null, sarPt = null, sarInt = null;
-    let autoCenter = true; 
+    let autoCenter = true;
     let flowVisible = true;
     let trendDiff = 0;
     let currentSpeed = 0;
     let navPath = [];
     let nextWpIndex = 0;
-    let navRouteNames = []; 
-    let isEmergency = false; 
-    let currentLevelNHN = -5.0; // Startwert (wird berechnet)
-    let globalTides = [];       // Globale Liste der Tiden
+    let navRouteNames = [];
+    let isEmergency = false;
+    let currentLevelNHN = -5.0;
+    let globalTides = [];
 
     const fleetConfig = [
         { id: "f3917", name: "F3917 ROTVE-KB", homeWp: "w814" },
         // Hier können später weitere Boote rein:
-        // { id: "f_res", name: "Reserveboot", homeWp: "w1" } 
+        // { id: "f_res", name: "Reserveboot", homeWp: "w1" }
     ];
 
-    let currentBoat = fleetConfig[0]; // Standard: F3917
-    let startFromBerth = true;        // Standard: Ab Anleger
+    let currentBoat = fleetConfig[0];
+    let startFromBerth = true;
 
-    // WICHTIG: Hier nur deklarieren, NICHT initialisieren!
-    let lockLayer; 
+    let lockLayer;
     let showLocks = false;
+    let lockOverrides = {};
+    let currentTheme = 0; // 0 = Dark, 1 = Tag, 2 = Nacht (Rot)
 
+    let homeMarkerLayer = L.layerGroup();
+
+    // =============================================================
     // INIT
-    window.onload = function() {
+    // =============================================================
+    window.onload = function () {
+        sizeMapWrapper();
+        window.addEventListener('resize', sizeMapWrapper);
+        window.addEventListener('orientationchange', sizeMapWrapper);
+
         initMap();
-        initFleet(); // <--- NEU
+        initFleet();
         buildGraph();
-        
-        // Data Fetching
+
         updateHydro();
         setInterval(updateHydro, 60000);
         setInterval(fetchWeather, 600000);
         fetchWeather();
         parseBSH();
-        
-        // Main Loop
-        requestAnimationFrame(mainLoop);
+        loadPegelData();
+        setInterval(loadPegelData, 5 * 60 * 1000);
     };
 
+    // Berechnet, wie groß die (quadratische) Kartenfläche sein muss,
+    // damit beim Rotieren nirgends eine Ecke sichtbar wird - und zwar
+    // exakt für die aktuelle Bildschirmgröße, nicht pauschal riesig.
+    function sizeMapWrapper() {
+        const diag = Math.ceil(Math.sqrt(window.innerWidth ** 2 + window.innerHeight ** 2) * 1.15);
+        document.documentElement.style.setProperty('--map-diag', diag + 'px');
+        if (map) setTimeout(() => map.invalidateSize(), 50);
+    }
+
     function initMap() {
-        // KORREKTUR: Kein 'const' oder 'let' davor! Wir nutzen die globale Variable 'map'.
-        map = L.map('map', {zoomControl: false}).setView([53.535, 9.980], 13);
-        
-        // Base Layers
+        map = L.map('map', { zoomControl: false }).setView([53.535, 9.980], 13);
+
         mapBaseLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(map);
         L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png', { opacity: 0.9 }).addTo(map);
 
-        // Layer initialisieren (jetzt existiert 'map')
         routeLayer = L.layerGroup().addTo(map);
         currentLayer = L.layerGroup().addTo(map);
         myPosLayer = L.layerGroup().addTo(map);
-        lockLayer = L.layerGroup().addTo(map); // Hier ist es sicher!
-        homeMarkerLayer.addTo(map); // <--- NEU: Layer für den Heimathafen
+        lockLayer = L.layerGroup().addTo(map);
+        homeMarkerLayer.addTo(map);
 
         map.on('click', onMapClick);
-
-        // FEATURE: Auto-Center ausschalten, wenn der User die Karte bewegt
-        map.on('dragstart', function() {
-            if(autoCenter) toggleAutoCenter(); 
+        map.on('dragstart', function () {
+            if (autoCenter) toggleAutoCenter();
         });
-        
-        // ... (Dein GPS Code bleibt gleich) ...
-       if (navigator.geolocation) {
-        navigator.geolocation.watchPosition(
-            (pos) => {
-                myPos = L.latLng(pos.coords.latitude, pos.coords.longitude);
-                if(pos.coords.speed !== null) currentSpeed = pos.coords.speed * 1.94384;
-                if(pos.coords.heading !== null && !isNaN(pos.coords.heading)) boatHeading = pos.coords.heading;
-                
-                drawBoat();
 
-                // HIER IST DIE NEUE LOGIK:
-                // Update wird nur ausgeführt, wenn tatsächlich ein neues GPS-Signal reinkommt!
-                if(autoCenter) {
-                    // Zoom Level anhand der Geschwindigkeit anpassen
-                    let z = 14;
-                    if(currentSpeed < 5) z=16;
-                    else if(currentSpeed < 15) z=15;
-                    
-                    if(map.getZoom() !== z) {
-                        map.setZoom(z, {animate: true});
+        if (navigator.geolocation) {
+            navigator.geolocation.watchPosition(
+                (pos) => {
+                    myPos = L.latLng(pos.coords.latitude, pos.coords.longitude);
+                    if (pos.coords.speed !== null) currentSpeed = pos.coords.speed * 1.94384;
+                    if (pos.coords.heading !== null && !isNaN(pos.coords.heading)) boatHeading = pos.coords.heading;
+
+                    drawBoat();
+
+                    // WICHTIG: Kartendrehung + Zentrierung + Nav-Update
+                    // passieren NUR HIER, also einmal pro GPS-Fix
+                    // (typischerweise ~1x/Sekunde), NICHT in einem
+                    // requestAnimationFrame-Loop. Das ist der zentrale
+                    // Performance-Fix gegenüber der alten Version.
+                    if (autoCenter) {
+                        if (navMode) {
+                            const mapEl = $('map');
+                            mapEl.style.transform = `translate(-50%, -50%) rotate(${-boatHeading}deg)`;
+                        }
+                        let z = 14;
+                        if (currentSpeed < 5) z = 16;
+                        else if (currentSpeed < 15) z = 15;
+                        if (map.getZoom() !== z) map.setZoom(z, { animate: false });
+                        map.panTo(myPos, { animate: true });
                     }
-                    
-                    // Karte zentrieren
-                    map.panTo(myPos, {animate: true});
 
-                    // Karte in Fahrtrichtung rotieren
-                    const mapEl = document.getElementById('map');
-                    mapEl.style.transformOrigin = "center center";
-                    mapEl.style.transform = `translate(-50%, -50%) rotate(-${boatHeading}deg)`;
-                }
+                    if (navMode) updateNavState();
+                },
+                (err) => { console.error("GPS Error", err); },
+                { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }
+            );
+        } else {
+            showSysMsg("Dein Browser unterstützt kein GPS.", "FEHLER");
+        }
+    }
 
-                // Navigations-HUD nur aktualisieren, wenn wir neue Geodaten haben
-                if(navMode) {
-                    updateNavState();
-                }
-            },
-            (err) => {
-                console.error("GPS Error", err);
-            },
-            {
-                enableHighAccuracy: true,
-                maximumAge: 0,
-                timeout: 5000
-            }
-        );
-    } else {
-        showSysMsg("Dein Browser unterstützt kein GPS.", "FEHLER");
-    }
-    }
-    
-let lockOverrides = {};
-    // --- HELPER: IST DIE SCHLEUSE OFFEN? ---
-// Hilfsfunktion: Gibt den Grund zurück, warum physikalisch gesperrt ist (oder null)
+    // =============================================================
+    // SCHLEUSEN / SPERRUNGEN
+    // =============================================================
     function getPhysicalBlockReason(props) {
-        // 1. Pegelstand (NHN)
         if (props.maxLevel !== undefined && currentLevelNHN > props.maxLevel) {
             return `PEGEL ZU HOCH (${currentLevelNHN.toFixed(2)}m > ${props.maxLevel}m)`;
         }
         if (props.minLevel !== undefined && currentLevelNHN < props.minLevel) {
             return `PEGEL ZU NIEDRIG (${currentLevelNHN.toFixed(2)}m < ${props.minLevel}m)`;
         }
-
-        // 2. Tide-Fenster (z.B. Tiefstack)
         if (props.tideRule && globalTides.length > 0) {
             const now = new Date();
-            // Finde das nächste oder letzte relevante Ereignis (z.B. Niedrigwasser 'N')
-            // Wir suchen alle NWs des Tages und prüfen, ob wir im Fenster liegen
             const relevantTides = globalTides.filter(t => t.type === props.tideRule.ref);
-            
             for (let tide of relevantTides) {
-                const diffMin = (now - tide.time) / 60000; // Differenz in Minuten
-                // start ist z.B. -120 (2h vorher), end ist 60 (1h danach)
-                // Wenn diffMin zwischen start und end liegt -> Treffer
+                const diffMin = (now - tide.time) / 60000;
                 if (diffMin >= props.tideRule.start && diffMin <= props.tideRule.end) {
                     return "TIDENSPERRUNG (NW +/-)";
                 }
             }
         }
-        return null; // Keine physikalische Sperre
+        return null;
     }
 
     function checkLockStatus(props) {
         if (!props) return true;
-        
-        // A) HARD BLOCK CHECK (Naturgesetze & Technische Sperrung)
-        // Hier greift keine manuelle Öffnung!
-        
-        // 1. Explizit dauerhaft gesperrt?
-        if (props.open === "GESPERRT" || props.open === "[keine]") {
-            return false;
-        }
 
-        // 2. Physikalische Gründe (Pegel/Tide)
-        if (getPhysicalBlockReason(props) !== null) {
-            return false; 
-        }
+        if (props.open === "GESPERRT" || props.open === "[keine]") return false;
+        if (getPhysicalBlockReason(props) !== null) return false;
 
-        // B) NOTFALL-OVERRIDE PRÜFEN (Manuelle Steuerung)
-        // Nur möglich, wenn A) nicht zutrifft
-        if (props.name && lockOverrides[props.name] === true) {
-            return true; 
-        }
+        if (props.name && lockOverrides[props.name] === true) return true;
 
-        // C) NORMALE ZEITPLANUNG (Regelbetrieb)
         const openRule = props.open;
-        if (!openRule) return true; 
+        if (!openRule) return true;
         if (openRule === "24h") return true;
 
         const now = new Date();
@@ -10920,366 +10930,280 @@ let lockOverrides = {};
             const endMinutes = h2 * 60 + m2;
             return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
         }
-        
+
         if (openRule.includes("Mo") || openRule.includes("Täglich")) {
-            return currentMinutes >= 360 && currentMinutes <= 1200; 
+            return currentMinutes >= 360 && currentMinutes <= 1200;
         }
 
-        return true; 
+        return true;
     }
-// 2. FUNKTION: Liste rendern (wird beim Tab-Wechsel aufgerufen)
-    // 2. FUNKTION: Liste rendern (Erweitert um Grenzwerte)
+
     function renderLockList() {
-        const container = document.getElementById('lock-list');
+        const container = $('lock-list');
         container.innerHTML = "";
-        
+
         const seenLocks = new Set();
-        
+
         connections.forEach(conn => {
             const props = conn[2];
-            if(props && props.type === 'lock' && props.name) {
-                if(seenLocks.has(props.name)) return;
-                seenLocks.add(props.name);
-                
-                const physBlockReason = getPhysicalBlockReason(props);
-                const isOpenReal = checkLockStatus(props); 
-                const isOverridden = lockOverrides[props.name] === true;
-                
-                // Zusatz-Infos generieren
-                let infoParts = [];
-                if (props.minLevel !== undefined || props.maxLevel !== undefined) {
-                    let text = "Pegel: ";
-                    if (props.minLevel !== undefined) text += `>${props.minLevel.toFixed(2)}m `;
-                    if (props.maxLevel !== undefined) text += `<${props.maxLevel.toFixed(2)}m `;
-                    infoParts.push(text + "NHN");
-                }
-                if (props.tideRule) {
-                    const startH = props.tideRule.start / 60;
-                    const endH = props.tideRule.end / 60;
-                    const sStr = startH > 0 ? `+${startH}` : startH;
-                    const eStr = endH > 0 ? `+${endH}` : endH;
-                    infoParts.push(`Sperrung: ${props.tideRule.ref} ${sStr}h bis ${eStr}h`);
-                }
-                
-                const extraInfoHtml = infoParts.length > 0 
-                    ? `<div style="grid-column: span 2; font-size: 0.8em; color: #94a3b8; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 5px; margin-top: 5px;">
-                         ℹ️ ${infoParts.join(' • ')}
-                       </div>` 
-                    : '';
+            if (!(props && props.type === 'lock' && props.name)) return;
+            if (seenLocks.has(props.name)) return;
+            seenLocks.add(props.name);
 
-                // --- BUTTON LOGIK ---
-                let btnClass = "override-btn";
-                let btnText = "📢 ALARMIEREN / BESETZEN";
-                let btnAction = `toggleLockOverride('${props.name}')`;
-                let btnStyle = "";
+            const physBlockReason = getPhysicalBlockReason(props);
+            const isOpenReal = checkLockStatus(props);
+            const isOverridden = lockOverrides[props.name] === true;
 
-                // Priorität 1: Technische Dauersperrung
-                if (props.open === "GESPERRT") {
-                    btnClass += " disabled";
-                    btnText = "⛔ TECHNISCH AUßER DIENST";
-                    btnAction = ""; // Klick deaktivieren
-                    btnStyle = "background: #331111; color: #ef4444; border-color: #552222; cursor: not-allowed; animation: none;";
-                }
-                // Priorität 2: Physikalische Sperrung (Pegel/Tide)
-                else if (physBlockReason) {
-                    btnClass += " disabled"; 
-                    btnText = `⛔ SPERRUNG AKTIV: ${physBlockReason}`;
-                    btnAction = ""; 
-                    btnStyle = "background: #331111; color: #ef4444; border-color: #552222; cursor: not-allowed; animation: none;";
-                } 
-                // Priorität 3: Override aktiv
-                else if (isOverridden) {
-                    btnClass += " active";
-                    btnText = "🚨 ALARMIERT & BESETZT (MANUELL OFFEN)";
-                }
-
-                const div = document.createElement('div');
-                div.className = 'lock-card';
-                div.innerHTML = `
-                    <div class="lock-header">
-                        <span class="lock-name">${props.name}</span>
-                        <span class="lock-status ${isOpenReal ? 'status-open' : 'status-closed'}">
-                            ${isOpenReal ? 'OFFEN' : 'GESCHLOSSEN'}
-                        </span>
-                    </div>
-                    <div class="lock-details">
-                        <div>🕒 ${props.open || '24h'}</div>
-                        <div>📞 <a href="tel:${props.phone || ''}" class="lock-phone">${props.phone || 'N/A'}</a></div>
-                        ${extraInfoHtml}
-                    </div>
-                    <div class="${btnClass}" style="${btnStyle}" onclick="${btnAction}">
-                        ${btnText}
-                    </div>
-                `;
-                container.appendChild(div);
+            let infoParts = [];
+            if (props.minLevel !== undefined || props.maxLevel !== undefined) {
+                let text = "Pegel: ";
+                if (props.minLevel !== undefined) text += `>${props.minLevel.toFixed(2)}m `;
+                if (props.maxLevel !== undefined) text += `<${props.maxLevel.toFixed(2)}m `;
+                infoParts.push(text + "NHN");
             }
+            if (props.tideRule) {
+                const startH = props.tideRule.start / 60;
+                const endH = props.tideRule.end / 60;
+                const sStr = startH > 0 ? `+${startH}` : startH;
+                const eStr = endH > 0 ? `+${endH}` : endH;
+                infoParts.push(`Sperrung: ${props.tideRule.ref} ${sStr}h bis ${eStr}h`);
+            }
+
+            const extraInfoHtml = infoParts.length > 0
+                ? `<div style="grid-column: span 2; font-size: 0.8em; color: #94a3b8; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 5px; margin-top: 5px;">
+                     ℹ️ ${infoParts.join(' • ')}
+                   </div>`
+                : '';
+
+            let btnClass = "override-btn";
+            let btnText = "📢 ALARMIEREN / BESETZEN";
+            let btnAction = `toggleLockOverride('${props.name}')`;
+            let btnStyle = "";
+
+            if (props.open === "GESPERRT") {
+                btnClass += " disabled";
+                btnText = "⛔ TECHNISCH AUßER DIENST";
+                btnAction = "";
+                btnStyle = "background: #331111; color: #ef4444; border-color: #552222; cursor: not-allowed; animation: none;";
+            } else if (physBlockReason) {
+                btnClass += " disabled";
+                btnText = `⛔ SPERRUNG AKTIV: ${physBlockReason}`;
+                btnAction = "";
+                btnStyle = "background: #331111; color: #ef4444; border-color: #552222; cursor: not-allowed; animation: none;";
+            } else if (isOverridden) {
+                btnClass += " active";
+                btnText = "🚨 ALARMIERT & BESETZT (MANUELL OFFEN)";
+            }
+
+            const div = document.createElement('div');
+            div.className = 'lock-card';
+            div.innerHTML = `
+                <div class="lock-header">
+                    <span class="lock-name">${props.name}</span>
+                    <span class="lock-status ${isOpenReal ? 'status-open' : 'status-closed'}">
+                        ${isOpenReal ? 'OFFEN' : 'GESCHLOSSEN'}
+                    </span>
+                </div>
+                <div class="lock-details">
+                    <div>🕒 ${props.open || '24h'}</div>
+                    <div>📞 <a href="tel:${props.phone || ''}" class="lock-phone">${props.phone || 'N/A'}</a></div>
+                    ${extraInfoHtml}
+                </div>
+                <div class="${btnClass}" style="${btnStyle}" onclick="${btnAction}">
+                    ${btnText}
+                </div>
+            `;
+            container.appendChild(div);
         });
-        
-        if(seenLocks.size === 0) container.innerHTML = "<p style='color:#666; text-align:center;'>Keine Schleusen definiert.</p>";
+
+        if (seenLocks.size === 0) container.innerHTML = "<p style='color:#666; text-align:center;'>Keine Schleusen definiert.</p>";
     }
-// 3. FUNKTION: Toggle Button Logik
-function toggleLockOverride(lockName) {
+
+    function toggleLockOverride(lockName) {
         if (lockOverrides[lockName]) {
-            delete lockOverrides[lockName]; // Zurücksetzen auf Automatik
+            delete lockOverrides[lockName];
         } else {
-            lockOverrides[lockName] = true; // Erzwinge OFFEN
+            lockOverrides[lockName] = true;
         }
-        
-        // UI Updates
-        renderLockList(); // Liste neu zeichnen
-        if(showLocks) toggleLocks(); toggleLocks(); // Hack: Karte neu zeichnen
-        
-        // Optional: Feedback Message
-        if(lockOverrides[lockName]) {
+
+        renderLockList();
+        if (showLocks) { showLocks = false; toggleLocks(); } // Karte neu zeichnen
+
+        if (lockOverrides[lockName]) {
             showSysMsg(`${lockName} wurde manuell auf OFFEN gesetzt. Routing führt nun hier durch.`, "SCHLEUSE BESETZT");
         }
     }
-// --- VISUALISIERUNG: KNOPF DRÜCKEN ---
-function toggleLocks() {
-    showLocks = !showLocks;
-    const btn = document.getElementById('btn-locks');
-    
-    if (!showLocks) {
-        lockLayer.clearLayers();
-        btn.classList.remove('active');
-        return;
-    }
-    
-    btn.classList.add('active');
-    lockLayer.clearLayers();
 
-    // Durchsuche alle Verbindungen nach Schleusen
-    connections.forEach(conn => {
-        const [idA, idB, props] = conn;
-        
-        if (props && props.type === 'lock') {
+    function toggleLocks() {
+        showLocks = !showLocks;
+        const btn = $('btn-locks');
+
+        if (!showLocks) {
+            lockLayer.clearLayers();
+            btn.classList.remove('active');
+            return;
+        }
+
+        btn.classList.add('active');
+        lockLayer.clearLayers();
+
+        connections.forEach(conn => {
+            const [idA, idB, props] = conn;
+            if (!(props && props.type === 'lock')) return;
+
             const nodeA = graph[idA];
             const nodeB = graph[idB];
-            
-            if (nodeA && nodeB) {
-                const midLat = (nodeA.lat + nodeB.lat) / 2;
-                const midLng = (nodeA.lng + nodeB.lng) / 2;
-                
-                const isOpen = checkLockStatus(props);
-                const color = isOpen ? '#22c55e' : '#ef4444'; // Grün oder Rot
-                const statusText = isOpen ? "GEOFFNET" : "GESCHLOSSEN";
+            if (!(nodeA && nodeB)) return;
 
-                const marker = L.circleMarker([midLat, midLng], {
-                    radius: 6, color: '#fff', weight: 1, fillColor: color, fillOpacity: 1
-                });
-                
-                marker.bindPopup(`
-                    <div style="text-align:center; font-family:'Inter'">
-                        <b>${props.name || 'Schleuse'}</b><br>
-                        <span style="color:${color}; font-weight:bold">${statusText}</span><br>
-                        <span style="font-size:0.8em; color:#888">${props.open || ''}</span>
-                    </div>
-                `);
-                lockLayer.addLayer(marker);
-            }
-        }
-    });
-}
+            const midLat = (nodeA.lat + nodeB.lat) / 2;
+            const midLng = (nodeA.lng + nodeB.lng) / 2;
 
-// --- UPDATE: BUILD GRAPH (Muss props speichern!) ---
-function buildGraph() {
-    for (let id in waypoints) {
-        graph[id] = { id: id, lat: waypoints[id][0], lng: waypoints[id][1], edges: [] };
-    }
-    connections.forEach(conn => {
-        // WICHTIG: Das dritte Element (props) mit auslesen!
-        const [a, b, props] = conn; 
-        if(graph[a] && graph[b]) {
-            const dist = map.distance([graph[a].lat, graph[a].lng], [graph[b].lat, graph[b].lng]);
-            const edgeProps = props || {}; // Leeres Objekt, falls keine Props
-            
-            graph[a].edges.push({ target: b, dist: dist, props: edgeProps });
-            graph[b].edges.push({ target: a, dist: dist, props: edgeProps });
-        }
-    });
-    // Optional: Debug Stats update
-    // document.getElementById('node-count').innerText = Object.keys(waypoints).length;
-}
+            const isOpen = checkLockStatus(props);
+            const color = isOpen ? '#22c55e' : '#ef4444';
+            const statusText = isOpen ? "GEOFFNET" : "GESCHLOSSEN";
 
-// --- UPDATE: FIND PATH (Mit Schleusen-Logik) ---
-    function findPath(startId, endId) {
-        let distances = {};
-        let prev = {};
-        let pq = new PriorityQueue();
-
-        distances[startId] = 0;
-        pq.enqueue(startId, 0);
-
-        for (let id in graph) {
-            if (id !== startId) distances[id] = Infinity;
-            prev[id] = null;
-        }
-
-        while (!pq.isEmpty()) {
-            let minNode = pq.dequeue();
-            let currId = minNode.element;
-            if (currId === endId) break;
-
-            graph[currId].edges.forEach(edge => {
-                let isPassable = true;
-                let penalty = 0;
-
-                // 1. SPERRUNGEN (Barrieren)
-                if (edge.props.blocked && !isEmergency) { 
-                    // Deine Daten nutzen 'blocked: true' statt type:'barrier' an manchen Stellen
-                    isPassable = false; 
-                }
-                if (edge.props.type === 'barrier' && !isEmergency) {
-                    isPassable = false;
-                }
-
-                // 2. SCHLEUSEN
-                if (edge.props.type === 'lock') {
-                    const isOpen = checkLockStatus(edge.props.open);
-                    if (!isOpen) {
-                        isPassable = false; // Zu ist zu.
-                    } else {
-                        penalty = 600; // 600m Strafe für Wartezeit beim Schleusen
-                    }
-                }
-
-                if (!isPassable) return; // Überspringen
-
-                let alt = distances[currId] + edge.dist + penalty;
-                if (alt < distances[edge.target]) {
-                    distances[edge.target] = alt;
-                    prev[edge.target] = currId;
-                    pq.enqueue(edge.target, alt);
-                }
+            const marker = L.circleMarker([midLat, midLng], {
+                radius: 6, color: '#fff', weight: 1, fillColor: color, fillOpacity: 1
             });
-        }
-        
-        let path = [];
-        let u = endId;
-        if (prev[u] || u === startId) {
-            while (u) {
-                path.unshift(graph[u]);
-                u = prev[u];
-            }
-        }
-        return path.length > 0 ? path : null;
+
+            marker.bindPopup(`
+                <div style="text-align:center; font-family:'Inter'">
+                    <b>${props.name || 'Schleuse'}</b><br>
+                    <span style="color:${color}; font-weight:bold">${statusText}</span><br>
+                    <span style="font-size:0.8em; color:#888">${props.open || ''}</span>
+                </div>
+            `);
+            lockLayer.addLayer(marker);
+        });
     }
 
-// Hilfsklasse Queue (falls du sie nicht mehr hast)
-    class PriorityQueue {
+    // =============================================================
+    // ROUTING (Graph + Dijkstra mit Min-Heap)
+    // =============================================================
+    function buildGraph() {
+        for (let id in waypoints) {
+            graph[id] = { id: id, lat: waypoints[id][0], lng: waypoints[id][1], edges: [] };
+        }
+        connections.forEach(conn => {
+            const [a, b, props] = conn;
+            if (graph[a] && graph[b]) {
+                const dist = map.distance([graph[a].lat, graph[a].lng], [graph[b].lat, graph[b].lng]);
+                const edgeProps = props || {};
+                graph[a].edges.push({ target: b, dist: dist, props: edgeProps });
+                graph[b].edges.push({ target: a, dist: dist, props: edgeProps });
+            }
+        });
+    }
+
+    // Einfacher binärer Min-Heap statt array.sort() bei jedem Dijkstra-Schritt.
+    class MinHeap {
         constructor() { this.items = []; }
-        enqueue(element, priority) {
-            let contain = false;
-            for (let i = 0; i < this.items.length; i++) {
-                if (this.items[i].priority > priority) {
-                    this.items.splice(i, 0, { element, priority });
-                    contain = true; break;
+        get size() { return this.items.length; }
+        push(id, priority) {
+            this.items.push({ id, priority });
+            let i = this.items.length - 1;
+            while (i > 0) {
+                const parent = (i - 1) >> 1;
+                if (this.items[parent].priority <= this.items[i].priority) break;
+                [this.items[parent], this.items[i]] = [this.items[i], this.items[parent]];
+                i = parent;
+            }
+        }
+        pop() {
+            const top = this.items[0];
+            const last = this.items.pop();
+            if (this.items.length > 0) {
+                this.items[0] = last;
+                let i = 0;
+                while (true) {
+                    const l = i * 2 + 1, r = i * 2 + 2;
+                    let smallest = i;
+                    if (l < this.items.length && this.items[l].priority < this.items[smallest].priority) smallest = l;
+                    if (r < this.items.length && this.items[r].priority < this.items[smallest].priority) smallest = r;
+                    if (smallest === i) break;
+                    [this.items[smallest], this.items[i]] = [this.items[i], this.items[smallest]];
+                    i = smallest;
                 }
             }
-            if (!contain) this.items.push({ element, priority });
+            return top;
         }
-        dequeue() { return this.items.shift(); }
-        isEmpty() { return this.items.length === 0; }
     }
 
-    // --- DIJKSTRA ROUTING ---
     function findNearest(ll) {
         let minD = Infinity, best = null;
-        for(let id in graph) {
+        for (let id in graph) {
             const d = map.distance(ll, [graph[id].lat, graph[id].lng]);
-            if(d < minD) { minD = d; best = id; }
+            if (d < minD) { minD = d; best = id; }
         }
         return best;
     }
 
-    
+    function runDijkstra(startId, endId, ignoreRestrictions) {
+        let dists = {}, prev = {};
+        const heap = new MinHeap();
+        for (let id in graph) dists[id] = Infinity;
+        dists[startId] = 0;
+        heap.push(startId, 0);
 
-    // --- DIJKSTRA ROUTING (Intelligent mit Umleitungswarnung) ---
-    // --- DIJKSTRA ROUTING (KORRIGIERT: Übergibt vollständige Objekte an Status-Check) ---
+        while (heap.size > 0) {
+            const { id: u, priority: du } = heap.pop();
+            if (du > dists[u]) continue; // veralteter Eintrag
+            if (u === endId) break;
+
+            graph[u].edges.forEach(e => {
+                let isPassable = true;
+                let penalty = 0;
+                const props = e.props || {};
+
+                if (!ignoreRestrictions) {
+                    if ((props.blocked || props.type === 'barrier') && !isEmergency) {
+                        isPassable = false;
+                    }
+                    if (props.type === 'lock') {
+                        const isOpen = checkLockStatus(props);
+                        if (!isOpen) isPassable = false;
+                        else penalty = 600;
+                    }
+                } else {
+                    if (props.type === 'lock') penalty = 600;
+                }
+
+                if (!isPassable) return;
+
+                const alt = dists[u] + e.dist + penalty;
+                if (alt < dists[e.target]) {
+                    dists[e.target] = alt;
+                    prev[e.target] = u;
+                    heap.push(e.target, alt);
+                }
+            });
+        }
+        return { dists, prev };
+    }
+
     function calculateRoute(startLL, endLL) {
-        if(Object.keys(graph).length === 0) return { path: [startLL, endLL], names: [] };
-        
+        if (Object.keys(graph).length === 0) return { path: [startLL, endLL], names: [] };
+
         const startId = findNearest(startLL);
         const endId = findNearest(endLL);
-        if(!startId || !endId || startId === endId) return { path: [startLL, endLL], names: [] };
+        if (!startId || !endId || startId === endId) return { path: [startLL, endLL], names: [] };
 
-        // Interne Routing-Logik
-        function runDijkstra(ignoreRestrictions) {
-            let dists = {}, prev = {}, pq = [{id: startId, d:0}];
-            for(let id in graph) dists[id] = Infinity;
-            dists[startId] = 0;
-
-            while(pq.length > 0) {
-                pq.sort((a,b)=>a.d - b.d);
-                let u = pq.shift().id;
-                if(u === endId) break;
-
-                graph[u].edges.forEach(e => {
-                    let isPassable = true;
-                    let penalty = 0;
-                    const props = e.props || {};
-
-                    // Wenn wir Einschränkungen beachten (Normalfall)
-                    if (!ignoreRestrictions) {
-                        // 1. Sperrungen (Barrieren) prüfen
-                        if ((props.blocked || props.type === 'barrier') && !isEmergency) {
-                            isPassable = false;
-                        }
-                        
-                        // 2. Schleusen prüfen
-                        if (props.type === 'lock') {
-                            // WICHTIG: Hier übergeben wir jetzt das GANZE Objekt 'props'
-                            // Vorher stand hier fälschlicherweise 'props.open'
-                            const isOpen = checkLockStatus(props); 
-                            
-                            if (!isOpen) {
-                                isPassable = false; // Zu ist zu.
-                            } else {
-                                penalty = 600; // Zeitstrafe für Schleusung
-                            }
-                        }
-                    } else {
-                        // Optimistischer Modus (für Vergleich)
-                        if (props.type === 'lock') penalty = 600;
-                    }
-
-                    if (!isPassable) return;
-
-                    let alt = dists[u] + e.dist + penalty;
-                    if(alt < dists[e.target]) {
-                        dists[e.target] = alt;
-                        prev[e.target] = u;
-                        pq.push({id:e.target, d:alt});
-                    }
-                });
-            }
-            return { dists, prev };
-        }
-
-        // SCHRITT 1: Analyse - Detour Check
+        // SCHRITT 1: Analyse - würde die ideale Route durch eine
+        // gesperrte Schleuse/Barriere führen? (nur Info für den User)
         let detourReason = null;
         if (!isEmergency) {
-            const sim = runDijkstra(true); // "Alles offen"-Simulation
-            
+            const sim = runDijkstra(startId, endId, true);
             let u = endId;
-            while(u && u !== startId) {
+            while (u && u !== startId) {
                 const p = sim.prev[u];
-                if(p) {
+                if (p) {
                     const edge = graph[p].edges.find(e => e.target === u);
-                    
-                    // Check: Würden wir idealerweise durch eine geschlossene Schleuse fahren?
-                    if(edge && edge.props && edge.props.type === 'lock') {
-                        // Auch hier: Das ganze Objekt übergeben!
+                    if (edge && edge.props && edge.props.type === 'lock') {
                         const isOpen = checkLockStatus(edge.props);
-                        if(!isOpen) {
-                            detourReason = edge.props.name || "Schleuse";
-                            break; 
-                        }
+                        if (!isOpen) { detourReason = edge.props.name || "Schleuse"; break; }
                     }
-                    // Check: Barriere
-                    if(edge && edge.props && (edge.props.blocked || edge.props.type === 'barrier')) {
-                         detourReason = edge.props.name || "Sperrung";
-                         break;
+                    if (edge && edge.props && (edge.props.blocked || edge.props.type === 'barrier')) {
+                        detourReason = edge.props.name || "Sperrung"; break;
                     }
                 }
                 u = p;
@@ -11287,501 +11211,358 @@ function buildGraph() {
         }
 
         // SCHRITT 2: Echte Route berechnen
-        const realCalc = runDijkstra(false); 
-        
-        if(realCalc.dists[endId] === Infinity) {
+        const real = runDijkstra(startId, endId, false);
+
+        if (real.dists[endId] === Infinity) {
             showSysMsg("Zielgebiet ist derzeit nicht erreichbar (Sperrung oder geschlossene Schleuse).", "ROUTING FEHLER");
             return { path: [startLL, endLL], names: [] };
         }
 
         let path = [], names = [], u = endId;
-        if(realCalc.prev[u] || u === startId) {
-            while(u) { 
+        if (real.prev[u] || u === startId) {
+            while (u) {
                 path.unshift(L.latLng(graph[u].lat, graph[u].lng));
-                const p = realCalc.prev[u];
-                if(p) {
+                const p = real.prev[u];
+                if (p) {
                     const edge = graph[p].edges.find(e => e.target === u);
-                    let edgeName = "";
-                    if(edge && edge.props && edge.props.name) edgeName = edge.props.name;
-                    names.unshift(edgeName);
+                    names.unshift(edge && edge.props && edge.props.name ? edge.props.name : "");
                 }
-                u = p; 
+                u = p;
             }
         }
-        
-        if(path.length > 0) {
+
+        if (path.length > 0) {
             path.unshift(startLL); names.unshift("ZUM START");
             path.push(endLL); names.push("ZIELGEBIET");
-            
+
             if (detourReason) {
                 showSysMsg(`Die Route wurde angepasst, da "${detourReason}" aktuell geschlossen ist.`, "UMLEITUNG AKTIV");
             }
-            
             return { path: path, names: names };
-        } else {
-            return { path: [startLL, endLL], names: [] };
         }
+        return { path: [startLL, endLL], names: [] };
     }
 
-    // --- INTERACTION ---
-    // Ersetzt die alte toggleNavMode Funktion
+    // =============================================================
+    // NAVIGATION / INTERAKTION
+    // =============================================================
     function toggleNavMode() {
-        if(navMode) {
-            // Wenn an -> Ausschalten
+        if (navMode) {
             stopNavigation();
         } else {
-            // Wenn aus -> Frage nach Modus
-            document.getElementById('nav-mode-overlay').style.display = 'flex';
+            $('nav-mode-overlay').style.display = 'flex';
         }
     }
-
-    function toggleLocks() {
-        showLocks = !showLocks;
-        const btn = document.getElementById('btn-locks');
-        
-        if (!showLocks) {
-            lockLayer.clearLayers();
-            btn.classList.remove('active');
-            return;
-        }
-        
-        btn.classList.add('active');
-        lockLayer.clearLayers();
-
-        connections.forEach(conn => {
-            const [idA, idB, props] = conn;
-            
-            // Wir suchen nur nach 'lock'
-            if (props && props.type === 'lock') {
-                const nodeA = graph[idA];
-                const nodeB = graph[idB];
-                
-                if (nodeA && nodeB) {
-                    // Berechne die Mitte zwischen den beiden Knoten
-                    const midLat = (nodeA.lat + nodeB.lat) / 2;
-                    const midLng = (nodeA.lng + nodeB.lng) / 2;
-                    
-                    const isOpen = checkLockStatus(props);
-                    const color = isOpen ? '#22c55e' : '#ef4444'; // Grün oder Rot
-                    const statusText = isOpen ? "GEOFFNET" : "GESCHLOSSEN";
-
-                    // Marker erstellen
-                    const marker = L.circleMarker([midLat, midLng], {
-                        radius: 6,
-                        color: '#fff',
-                        weight: 1,
-                        fillColor: color,
-                        fillOpacity: 1
-                    });
-                    
-                    marker.bindPopup(`
-                        <b>${props.name || 'Schleuse'}</b><br>
-                        Status: <span style="color:${color}; font-weight:bold">${statusText}</span><br>
-                        <span style="font-size:0.8em">${props.open}</span>
-                    `);
-                    
-                    lockLayer.addLayer(marker);
-                }
-            }
-        });
-    }
-
 
     function setNavType(emergency) {
         isEmergency = emergency;
-        document.getElementById('nav-mode-overlay').style.display = 'none';
-        
-        // Jetzt den Modus aktivieren
+        $('nav-mode-overlay').style.display = 'none';
+
         navMode = true;
-        const btn = document.getElementById('btn-nav');
+        const btn = $('btn-nav');
         btn.classList.add('active');
-        
-        // Optisches Feedback für Einsatzmodus
-        if(isEmergency) {
+
+        if (isEmergency) {
             btn.style.background = "var(--alert)";
             btn.style.borderColor = "#fff";
             showSysMsg("EINSATZ-MODUS AKTIV.\nSperrungen werden ignoriert.\nKlicke auf das ZIEL.", "🚨 EINSATZ");
         } else {
-            btn.style.background = ""; // Reset
+            btn.style.background = "";
             showSysMsg("Klicke jetzt auf die Karte, um dein ZIEL zu setzen.", "ROUTING");
         }
-        
-        // Map Setup
+
         map.getContainer().style.cursor = 'crosshair';
-        autoCenter = false; 
-        document.getElementById('btn-center').classList.remove('active');
-        document.getElementById('map').style.transform = `translate(-50%, -50%) rotate(0deg)`;
+        autoCenter = false;
+        $('btn-center').classList.remove('active');
+        $('map').style.transform = `translate(-50%, -50%) rotate(0deg)`;
     }
 
     function cancelNavSetup() {
-        document.getElementById('nav-mode-overlay').style.display = 'none';
+        $('nav-mode-overlay').style.display = 'none';
     }
 
-    // Globale Variable für die Namen hinzufügen (oben bei den anderen lets)
- 
-
     function onMapClick(e) {
-        if(document.getElementById('sar-modal').style.display === 'block') return;
-        
-        // GPS Fallback nur setzen, wenn wir keinen Anleger-Start haben
-        if(!myPos && !startFromBerth) { 
-            // Optional: Dummy Position setzen oder Warnung
-            // myPos = e.latlng; drawBoat(); 
+        if ($('sar-modal').style.display === 'block') return;
+
+        if (!myPos && !startFromBerth) {
             showSysMsg("Kein GPS Signal! Bitte 'Ab Anleger' wählen oder warten.", "GPS FEHLER");
             return;
         }
 
-        if(navMode) {
-            let startPos = null;
+        if (!navMode) return;
 
-            // --- ENTSCHEIDUNG: ANLEGER ODER GPS? ---
-            if (startFromBerth) {
-                // Koordinaten aus den Waypoints holen
-                const homeCoords = waypoints[currentBoat.homeWp];
-                if (homeCoords) {
-                    startPos = L.latLng(homeCoords[0], homeCoords[1]);
-                } else {
-                    showSysMsg("Fehler: Heimathafen-Koordinaten nicht gefunden!", "SYSTEM FEHLER");
-                    return;
-                }
+        let startPos = null;
+        if (startFromBerth) {
+            const homeCoords = waypoints[currentBoat.homeWp];
+            if (homeCoords) {
+                startPos = L.latLng(homeCoords[0], homeCoords[1]);
             } else {
-                // GPS nutzen
-                startPos = myPos;
+                showSysMsg("Fehler: Heimathafen-Koordinaten nicht gefunden!", "SYSTEM FEHLER");
+                return;
             }
-            // ---------------------------------------
-
-            // Routing starten
-            const result = calculateRoute(startPos, e.latlng);
-            navPath = result.path;
-            navRouteNames = result.names;
-            
-            nextWpIndex = 1;
-
-            routeLayer.clearLayers();
-            
-            // Startpunkt visualisieren (anders als Schiff)
-            if(startFromBerth) {
-                L.circleMarker(startPos, {color:'#facc15', radius:5, fillColor:'#000', fillOpacity:1}).addTo(routeLayer);
-            }
-
-            // Route zeichnen
-            L.polyline(navPath, {color: '#ef4444', weight: 6, opacity: 0.9}).addTo(routeLayer);
-            L.circleMarker(e.latlng, {color:'#ef4444', radius:8}).addTo(routeLayer);
-
-            document.getElementById('nav-hud').style.display = 'block';
-            
-            // AutoCenter nur aktivieren, wenn wir "Ab Standort" fahren. 
-            // Bei "Ab Anleger" wollen wir vielleicht eher die Route sehen.
-            if (!startFromBerth) {
-                autoCenter = true;
-                document.getElementById('btn-center').classList.add('active');
-            } else {
-                autoCenter = false;
-                document.getElementById('btn-center').classList.remove('active');
-                // Karte so zoomen, dass Start und Ziel drauf sind
-                const group = new L.featureGroup([L.marker(startPos), L.marker(e.latlng)]);
-                map.fitBounds(group.getBounds(), {padding: [50, 50]});
-            }
-            
-            map.getContainer().style.cursor = '';
-            updateNavState();
+        } else {
+            startPos = myPos;
         }
+
+        const result = calculateRoute(startPos, e.latlng);
+        navPath = result.path;
+        navRouteNames = result.names;
+        nextWpIndex = 1;
+
+        routeLayer.clearLayers();
+
+        if (startFromBerth) {
+            L.circleMarker(startPos, { color: '#facc15', radius: 5, fillColor: '#000', fillOpacity: 1 }).addTo(routeLayer);
+        }
+
+        L.polyline(navPath, { color: '#ef4444', weight: 6, opacity: 0.9 }).addTo(routeLayer);
+        L.circleMarker(e.latlng, { color: '#ef4444', radius: 8 }).addTo(routeLayer);
+
+        $('nav-hud').style.display = 'block';
+
+        if (!startFromBerth) {
+            autoCenter = true;
+            $('btn-center').classList.add('active');
+        } else {
+            autoCenter = false;
+            $('btn-center').classList.remove('active');
+            const group = new L.featureGroup([L.marker(startPos), L.marker(e.latlng)]);
+            map.fitBounds(group.getBounds(), { padding: [50, 50] });
+        }
+
+        map.getContainer().style.cursor = '';
+        updateNavState();
     }
 
     function stopNavigation() {
         navMode = false;
         navPath = [];
-        isEmergency = false; // Reset Status
+        isEmergency = false;
 
-        const btn = document.getElementById('btn-nav');
+        const btn = $('btn-nav');
         btn.classList.remove('active');
-        btn.style.background = ""; // Farbe Reset
+        btn.style.background = "";
         btn.style.borderColor = "";
 
-        document.getElementById('nav-hud').style.display = 'none';
+        $('nav-hud').style.display = 'none';
         routeLayer.clearLayers();
         autoCenter = false;
-        document.getElementById('btn-center').classList.remove('active');
-        document.getElementById('map').style.transform = `translate(-50%, -50%) rotate(0deg)`;
+        $('btn-center').classList.remove('active');
+        $('map').style.transform = `translate(-50%, -50%) rotate(0deg)`;
         map.getContainer().style.cursor = '';
     }
 
     function toggleAutoCenter() {
-    autoCenter = !autoCenter;
-    const btn = document.getElementById('btn-center');
-    const mapEl = document.getElementById('map');
-    
-    if(autoCenter) {
-        btn.classList.add('active');
-        
-        // Sanfte Drehung bei automatischer GPS-Navigation wieder erlauben
-        mapEl.style.transition = 'transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1)';
-        
-        if(myPos) map.setView(myPos, map.getZoom());
-    } else {
-        btn.classList.remove('active');
-        
-        // WICHTIG: Animation hart abschalten, bevor die Rotation resettet wird!
-        // Das verhindert das Berechnungschaos und den Memory-Crash beim Draggen.
-        mapEl.style.transition = 'none'; 
-        mapEl.style.transform = `translate(-50%, -50%) rotate(0deg)`;
-    }
-}
+        autoCenter = !autoCenter;
+        const btn = $('btn-center');
+        const mapEl = $('map');
 
-    
-    
-    function updateNavState() {
-        if(navPath.length === 0 || nextWpIndex >= navPath.length) return;
-        
-        const distToWp = map.distance(myPos, navPath[nextWpIndex]);
-        const distToTarget = map.distance(myPos, navPath[navPath.length-1]);
-        
-        document.getElementById('hud-dist').innerText = (distToTarget/1852).toFixed(2);
-        document.getElementById('hud-sog').innerText = currentSpeed.toFixed(1);
-        document.getElementById('hud-cog').innerText = Math.round(boatHeading).toString().padStart(3,'0');
-        
-        // --- NAMEN ANZEIGEN ---
-        // Wir nehmen den Namen des Segments, auf das wir gerade zusteuern
-        let roadName = "";
-        if(navRouteNames && navRouteNames[nextWpIndex-1]) {
-             roadName = navRouteNames[nextWpIndex-1];
+        if (autoCenter) {
+            btn.classList.add('active');
+            if (myPos) map.setView(myPos, map.getZoom());
+        } else {
+            btn.classList.remove('active');
+            mapEl.style.transform = `translate(-50%, -50%) rotate(0deg)`;
         }
-        // Falls leer, Platzhalter
-        document.getElementById('turn-street').innerText = roadName || "FAHRWASSER";
+    }
 
+    function updateNavState() {
+        if (navPath.length === 0 || nextWpIndex >= navPath.length) return;
 
-        // Next WP Logic
+        const distToWp = map.distance(myPos, navPath[nextWpIndex]);
+        const distToTarget = map.distance(myPos, navPath[navPath.length - 1]);
 
-        // Neuer Code: Ersetzt den alten if-Block komplett
+        setText('hud-dist', (distToTarget / 1852).toFixed(2));
+        setText('hud-sog', currentSpeed.toFixed(1));
+        setText('hud-cog', Math.round(boatHeading).toString().padStart(3, '0'));
+
+        let roadName = "";
+        if (navRouteNames && navRouteNames[nextWpIndex - 1]) {
+            roadName = navRouteNames[nextWpIndex - 1];
+        }
+        setText('turn-street', roadName || "FAHRWASSER");
+
         let advanced = false;
-                
-        // 1. Großzügiger Hit-Radius (100m)
-        if(distToWp < 100) {
+
+        if (distToWp < 100) {
             advanced = true;
-        } 
-        // 2. Querab-Prüfung: Haben wir den Waypoint passiert?
-        else if (nextWpIndex > 0) {
+        } else if (nextWpIndex > 0) {
             const prevWp = navPath[nextWpIndex - 1];
             const currentWp = navPath[nextWpIndex];
-            
-            // Geplante Peilung des aktuellen Streckenabschnitts
             const bearingSegment = L.GeometryUtil.bearing(prevWp, currentWp);
-            // Tatsächliche Peilung vom Boot zum Waypoint
             const bearingToWp = L.GeometryUtil.bearing(myPos, currentWp);
-            
-            // Abweichung berechnen
             let diff = Math.abs((bearingSegment - bearingToWp + 360) % 360);
             if (diff > 180) diff = 360 - diff;
-            
-            if (diff > 90 && distToWp < 400) {
-                advanced = true;
-            }
+            if (diff > 90 && distToWp < 400) advanced = true;
         }
 
-        // 3. Fallback: Ist der übernächste Punkt schon näher als der aktuelle?
         if (!advanced && nextWpIndex + 1 < navPath.length) {
             const distToNextNext = map.distance(myPos, navPath[nextWpIndex + 1]);
-            if (distToNextNext < distToWp) {
-                advanced = true;
-            }
+            if (distToNextNext < distToWp) advanced = true;
         }
 
-        // Wegpunkt erfolgreich passiert -> zum nächsten schalten
-        if(advanced) {
+        if (advanced) {
             nextWpIndex++;
-            if(nextWpIndex >= navPath.length) {
-                document.getElementById('turn-text').innerText = "ZIEL ERREICHT";
-                document.getElementById('turn-arrow').innerText = "🏁";
-                document.getElementById('turn-street').innerText = "";
+            if (nextWpIndex >= navPath.length) {
+                setText('turn-text', "ZIEL ERREICHT");
+                setText('turn-arrow', "🏁");
+                setText('turn-street', "");
                 return;
             }
         }
-        
-        
-        document.getElementById('turn-dist').innerText = Math.round(distToWp) + " m";
-        
-        if(navPath[nextWpIndex+1]) {
+
+        setText('turn-dist', Math.round(distToWp) + " m");
+
+        if (navPath[nextWpIndex + 1]) {
             const currentWp = navPath[nextWpIndex];
-            const nextWp = navPath[nextWpIndex+1];
-            
+            const nextWp = navPath[nextWpIndex + 1];
+
             const b1 = L.GeometryUtil.bearing(myPos, currentWp);
             const b2 = L.GeometryUtil.bearing(currentWp, nextWp);
-            
+
             let diff = (b2 - b1 + 360) % 360;
-            if(diff > 180) diff -= 360;
-            
-            if(diff > 25) {
-                document.getElementById('turn-text').innerText = "STEUERBORD";
-                document.getElementById('turn-text').style.color = "#22c55e"; 
-                document.getElementById('turn-arrow').innerText = "↗️";
-            } else if(diff < -25) {
-                document.getElementById('turn-text').innerText = "BACKBORD";
-                document.getElementById('turn-text').style.color = "#ef4444"; 
-                document.getElementById('turn-arrow').innerText = "↖️";
+            if (diff > 180) diff -= 360;
+
+            if (diff > 25) {
+                setText('turn-text', "STEUERBORD");
+                $('turn-text').style.color = "#22c55e";
+                setText('turn-arrow', "↗️");
+            } else if (diff < -25) {
+                setText('turn-text', "BACKBORD");
+                $('turn-text').style.color = "#ef4444";
+                setText('turn-arrow', "↖️");
             } else {
-                document.getElementById('turn-text').innerText = "KURS HALTEN";
+                setText('turn-text', "KURS HALTEN");
                 const isDay = document.body.classList.contains('day-mode');
-                document.getElementById('turn-text').style.color = isDay ? "#0f172a" : "#fff";
-                document.getElementById('turn-arrow').innerText = "⬆️";
+                $('turn-text').style.color = isDay ? "#0f172a" : "#fff";
+                setText('turn-arrow', "⬆️");
             }
         } else {
-             document.getElementById('turn-text').innerText = "ZUM ZIEL";
-             document.getElementById('turn-arrow').innerText = "🏁";
+            setText('turn-text', "ZUM ZIEL");
+            setText('turn-arrow', "🏁");
         }
     }
 
     function drawBoat() {
-        // Wenn noch kein Marker da ist -> Erstellen
-        if(!boatMarker) {
-             const icon = L.divIcon({
+        if (!boatMarker) {
+            const icon = L.divIcon({
                 className: 'boat-wrap',
                 html: '<i class="fa-solid fa-location-arrow boat-icon"></i>',
                 iconSize: [30, 30],
                 iconAnchor: [15, 15]
             });
-            // Marker erstellen und global speichern
-            boatMarker = L.marker(myPos, {icon: icon, zIndexOffset: 1000}).addTo(myPosLayer);
+            boatMarker = L.marker(myPos, { icon: icon, zIndexOffset: 1000 }).addTo(myPosLayer);
         } else {
-            // Wenn schon da -> Nur Position updaten (KEIN Flackern mehr)
             boatMarker.setLatLng(myPos);
         }
-        
-        // Rotation des Icons anpassen
+
         const iconEl = document.querySelector('.boat-icon');
-        if(iconEl) iconEl.style.transform = `rotate(${boatHeading - 45}deg)`;
+        if (iconEl) iconEl.style.transform = `rotate(${boatHeading - 45}deg)`;
     }
 
-    // --- DATA FETCH ---
+    // =============================================================
+    // HYDRO / WETTER / TIDEN
+    // =============================================================
     async function updateHydro() {
         try {
             const res = await fetch("https://www.pegelonline.wsv.de/webservices/rest-api/v2/stations/d488c5cc-4de9-4631-8ce1-0db0e700b546/W/measurements.json?start=P0DT0H20M");
             const data = await res.json();
-            const val = data[data.length-1].value; 
-            
-            document.getElementById('val-pegel').innerText = val;
-            
-            // --- BERECHNUNG & ANZEIGE ---
-            currentLevelNHN = (val - 500) / 100; 
-            
-            // NEU: Wert ins HTML schreiben (mit Vorzeichen)
+            const val = data[data.length - 1].value;
+
+            setText('val-pegel', val);
+
+            currentLevelNHN = (val - 500) / 100;
             const sign = currentLevelNHN >= 0 ? "+" : "";
-            document.getElementById('val-nhn').innerText = `${sign}${currentLevelNHN.toFixed(2)} mNHN`;
-            // ----------------------------
+            setText('val-nhn', `${sign}${currentLevelNHN.toFixed(2)} mNHN`);
 
             const diff = val - data[0].value;
-            // ... (Rest der Funktion bleibt gleich)
-            trendDiff = diff; 
-            document.getElementById('val-trend').innerText = (diff>0?"+":"")+diff;
-            
-            const sm = document.getElementById('val-tide-status');
-            if(diff < 0) { sm.innerText="ABLAUFEND"; sm.style.color="#22d3ee"; }
-            else { sm.innerText="AUFLAUFEND"; sm.style.color="#fbbf24"; }
-            
-            document.getElementById('status-dot').style.color="var(--good)";
-            document.getElementById('status-dot').innerText="● ONLINE";
-            
-            const speed = 0.2 + (Math.abs(trendDiff)/100)*1.5;
-            document.getElementById('val-flow').innerText = speed.toFixed(1) + " m/s";
-            
+            trendDiff = diff;
+            setText('val-trend', (diff > 0 ? "+" : "") + diff);
+
+            const sm = $('val-tide-status');
+            if (diff < 0) { sm.innerText = "ABLAUFEND"; sm.style.color = "#22d3ee"; }
+            else { sm.innerText = "AUFLAUFEND"; sm.style.color = "#fbbf24"; }
+
+            $('status-dot').style.color = "var(--good)";
+            setText('status-dot', "● ONLINE");
+
+            const speed = 0.2 + (Math.abs(trendDiff) / 100) * 1.5;
+            setText('val-flow', speed.toFixed(1) + " m/s");
+
             drawCurrents();
-        } catch(e) {
+        } catch (e) {
             console.log("Offline");
-            // Fallback Werte für Simulation
-            currentLevelNHN = 0.5; // Angenommenes Mittelwasser
+            currentLevelNHN = 0.5;
         }
-        
-        // WICHTIG: Liste neu zeichnen, da sich Status geändert haben könnte
-        if(document.getElementById('view-locks').classList.contains('active')) {
+
+        if ($('view-locks').classList.contains('active')) {
             renderLockList();
         }
         updateTiefstack();
     }
 
     async function loadPegelData() {
-    const pegelNummer = "5952050"; // St. Pauli
-    const apiUrl = `https://www.pegelonline.wsv.de/webservices/rest-api/v2/gewaesser/ELBE/pegel/HAMBURG%20ST.%20PAULI/messwerte.json?start=P1D`;
+        const apiUrl = `https://www.pegelonline.wsv.de/webservices/rest-api/v2/gewaesser/ELBE/pegel/HAMBURG%20ST.%20PAULI/messwerte.json?start=P1D`;
 
-    try {
-        const response = await fetch(apiUrl);
-        if (!response.ok) throw new Error("Fehler beim Laden der Pegeldaten");
-        const data = await response.json();
+        try {
+            const response = await fetch(apiUrl);
+            if (!response.ok) throw new Error("Fehler beim Laden der Pegeldaten");
+            const data = await response.json();
+            if (!data || data.length === 0) return;
 
-        if (!data || data.length === 0) return;
+            const latest = data[data.length - 1];
+            setText('pegel-current-val', `${latest.value} cm`);
 
-        // Aktuellen Wert oben rechts anzeigen
-        const latest = data[data.length - 1];
-        document.getElementById('pegel-current-val').innerText = `${latest.value} cm`;
+            const startTimeStr = new Date(data[0].timestamp).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+            const endTimeStr = new Date(latest.timestamp).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+            setText('pegel-start-time', startTimeStr);
+            setText('pegel-end-time', endTimeStr);
 
-        // Zeitstempel für die Achsen-Beschriftung extrahieren
-        const startTimeStr = new Date(data[0].timestamp).toLocaleTimeString('de-DE', {hour: '2-digit', minute:'2-digit'});
-        const endTimeStr = new Date(latest.timestamp).toLocaleTimeString('de-DE', {hour: '2-digit', minute:'2-digit'});
-        document.getElementById('pegel-start-time').innerText = startTimeStr;
-        document.getElementById('pegel-end-time').innerText = endTimeStr;
+            const values = data.map(d => d.value);
+            const minVal = Math.min(...values) - 20;
+            const maxVal = Math.max(...values) + 20;
+            const valRange = maxVal - minVal;
 
-        // Werte für die Skalierung ermitteln
-        const values = data.map(d => d.value);
-        const minVal = Math.min(...values) - 20; // 20cm Puffer nach unten
-        const maxVal = Math.max(...values) + 20; // 20cm Puffer nach oben
-        const valRange = maxVal - minVal;
+            const svgWidth = 500, svgHeight = 200, paddingBottom = 20, paddingTop = 10;
+            const chartHeight = svgHeight - paddingTop - paddingBottom;
 
-        // SVG Dimensionen (müssen mit viewBox übereinstimmen)
-        const svgWidth = 500;
-        const svgHeight = 200;
-        const paddingBottom = 20;
-        const paddingTop = 10;
-        const chartHeight = svgHeight - paddingTop - paddingBottom;
+            let points = "";
+            let fillPoints = `0,${svgHeight} `;
 
-        // Punkte für die SVG-Linie berechnen
-        let points = "";
-        let fillPoints = `0,${svgHeight} `; // Startpunkt für die Flächenfüllung
+            data.forEach((d, index) => {
+                const x = (index / (data.length - 1)) * svgWidth;
+                const y = svgHeight - paddingBottom - ((d.value - minVal) / valRange) * chartHeight;
+                points += `${x},${y} `;
+                fillPoints += `${x},${y} `;
+            });
+            fillPoints += `${svgWidth},${svgHeight}`;
 
-        data.forEach((d, index) => {
-            const x = (index / (data.length - 1)) * svgWidth;
-            // Y-Achse ist im SVG invertiert (0 ist oben)
-            const y = svgHeight - paddingBottom - ((d.value - minVal) / valRange) * chartHeight;
-            
-            points += `${x},${y} `;
-            fillPoints += `${x},${y} `;
-        });
-
-        fillPoints += `${svgWidth},${svgHeight}`;
-
-        // SVG Inhalt dynamisch zusammenbauen
-        const svg = document.getElementById('pegel-svg');
-        svg.innerHTML = `
-            <line x1="0" y1="${paddingTop}" x2="${svgWidth}" y2="${paddingTop}" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4"/>
-            <line x1="0" y1="${svgHeight - paddingBottom}" x2="${svgWidth}" y2="${svgHeight - paddingBottom}" stroke="rgba(255,255,255,0.1)"/>
-            
-            <text x="5" y="${paddingTop + 12}" fill="#6b7280" font-size="10" font-family="monospace">${Math.round(maxVal - 20)} cm</text>
-            <text x="5" y="${svgHeight - paddingBottom - 4}" fill="#6b7280" font-size="10" font-family="monospace">${Math.round(minVal + 20)} cm</text>
-
-            <defs>
-                <linearGradient id="pegel-grad" x1="0%" y1="0%" x2="0%" y2="100%">
-                    <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.25" />
-                    <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.0" />
-                </linearGradient>
-            </defs>
-
-            <polygon points="${fillPoints}" fill="url(#pegel-grad)" />
-
-            <polyline points="${points}" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-        `;
-
-    } catch (error) {
-        console.error("Pegel-Fehler:", error);
-        document.getElementById('pegel-current-val').innerText = "Fehler";
+            $('pegel-svg').innerHTML = `
+                <line x1="0" y1="${paddingTop}" x2="${svgWidth}" y2="${paddingTop}" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4"/>
+                <line x1="0" y1="${svgHeight - paddingBottom}" x2="${svgWidth}" y2="${svgHeight - paddingBottom}" stroke="rgba(255,255,255,0.1)"/>
+                <text x="5" y="${paddingTop + 12}" fill="#6b7280" font-size="10" font-family="monospace">${Math.round(maxVal - 20)} cm</text>
+                <text x="5" y="${svgHeight - paddingBottom - 4}" fill="#6b7280" font-size="10" font-family="monospace">${Math.round(minVal + 20)} cm</text>
+                <defs>
+                    <linearGradient id="pegel-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+                        <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.25" />
+                        <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.0" />
+                    </linearGradient>
+                </defs>
+                <polygon points="${fillPoints}" fill="url(#pegel-grad)" />
+                <polyline points="${points}" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            `;
+        } catch (error) {
+            console.error("Pegel-Fehler:", error);
+            setText('pegel-current-val', "Fehler");
+        }
     }
-}
 
-// Optional: Automatisch alle 5 Minuten aktualisieren
-setInterval(loadPegelData, 5 * 60 * 1000);
-    
     function drawCurrents() {
         currentLayer.clearLayers();
-        if(!flowVisible || riverGeometries.length === 0) return;
+        if (!flowVisible || riverGeometries.length === 0) return;
         const isEbbe = (trendDiff < 0);
         const color = isEbbe ? "#22d3ee" : "#fbbf24";
-        const delay = Math.max(500, 3000 - (Math.abs(trendDiff)*20));
+        const delay = Math.max(500, 3000 - (Math.abs(trendDiff) * 20));
 
         riverGeometries.forEach(item => {
             const river = L.polyline.antPath(item.path, {
@@ -11795,32 +11576,31 @@ setInterval(loadPegelData, 5 * 60 * 1000);
 
     function toggleFlow() {
         flowVisible = !flowVisible;
-        document.getElementById('btn-flow').classList.toggle('active');
+        $('btn-flow').classList.toggle('active');
         drawCurrents();
     }
 
     async function fetchWeather() {
         try {
-             const wRes = await fetch('https://api.open-meteo.com/v1/forecast?latitude=53.55&longitude=9.97&current=temperature_2m,wind_speed_10m,wind_direction_10m&daily=sunrise,sunset&timezone=Europe%2FBerlin');
-             const wData = await wRes.json();
-             document.getElementById('val-air').innerText = Math.round(wData.current.temperature_2m)+"°";
-             document.getElementById('val-wind').innerText = Math.round(wData.current.wind_speed_10m)+" km/h";
-             document.getElementById('val-sunrise').innerText = wData.daily.sunrise[0].split('T')[1];
-             document.getElementById('val-sunset').innerText = wData.daily.sunset[0].split('T')[1];
-        } catch(e){}
-        document.getElementById('val-water').innerText = "6°"; 
+            const wRes = await fetch('https://api.open-meteo.com/v1/forecast?latitude=53.55&longitude=9.97&current=temperature_2m,wind_speed_10m,wind_direction_10m&daily=sunrise,sunset&timezone=Europe%2FBerlin');
+            const wData = await wRes.json();
+            setText('val-air', Math.round(wData.current.temperature_2m) + "°");
+            setText('val-wind', Math.round(wData.current.wind_speed_10m) + " km/h");
+            setText('val-sunrise', wData.daily.sunrise[0].split('T')[1]);
+            setText('val-sunset', wData.daily.sunset[0].split('T')[1]);
+        } catch (e) { }
+        setText('val-water', "6°");
         updateHypothermia(6);
     }
-    
+
     function updateHypothermia(t) {
-        const el = document.getElementById('hypo-warn');
-        if(t<5) { el.innerText="⚠️ LEBENSGEFAHR <15 MIN"; el.style.color="#ef4444"; }
-        else if(t<10) { el.innerText="⚠️ KRITISCH <1 STD"; el.style.color="#f97316"; }
-        else { el.innerText="AKUT STABIL"; el.style.color="#22c55e"; }
+        const el = $('hypo-warn');
+        if (t < 5) { el.innerText = "⚠️ LEBENSGEFAHR <15 MIN"; el.style.color = "#ef4444"; }
+        else if (t < 10) { el.innerText = "⚠️ KRITISCH <1 STD"; el.style.color = "#f97316"; }
+        else { el.innerText = "AKUT STABIL"; el.style.color = "#22c55e"; }
     }
 
     function updateTiefstack() {
-        // 1. Wir suchen die Tiefstackschleuse in den Connections
         let lockProps = null;
         for (let conn of connections) {
             if (conn[2] && conn[2].name === "Tiefstackschleuse") {
@@ -11828,18 +11608,14 @@ setInterval(loadPegelData, 5 * 60 * 1000);
                 break;
             }
         }
+        if (!lockProps) return;
 
-        if (!lockProps) return; // Sollte nicht passieren
-
-        // 2. Status prüfen (mit unserer neuen Smart-Logik)
         const isOpen = checkLockStatus(lockProps);
         const physReason = getPhysicalBlockReason(lockProps);
-        
-        // 3. UI Elemente holen
-        const elStatus = document.getElementById('ts-status');
-        const elReason = document.getElementById('ts-reason');
 
-        // 4. Anzeigen
+        const elStatus = $('ts-status');
+        const elReason = $('ts-reason');
+
         if (isOpen) {
             elStatus.innerText = "OFFEN";
             elStatus.style.color = "var(--good)";
@@ -11848,126 +11624,97 @@ setInterval(loadPegelData, 5 * 60 * 1000);
         } else {
             elStatus.innerText = "GESCHLOSSEN";
             elStatus.style.color = "var(--alert)";
-            
-            // Grund ermitteln
             if (physReason) {
-                elReason.innerText = physReason; // z.B. "PEGEL ZU HOCH..."
+                elReason.innerText = physReason;
                 elReason.style.color = "var(--alert)";
             } else {
-                // Wenn nicht physikalisch, dann liegt es an der Öffnungszeit
-                elReason.innerText = "Außerhalb der Betriebszeiten"; 
+                elReason.innerText = "Außerhalb der Betriebszeiten";
                 elReason.style.color = "var(--dim)";
             }
         }
     }
 
     function parseBSH() {
-        if(!bshData) return;
+        if (!bshData) return;
         const lines = bshData.split('\n');
-        let parsedTides = []; // Lokale temp Variable
-        
+        let parsedTides = [];
+
         lines.forEach(l => {
-            if(!l.includes("VB2")) return;
+            if (!l.includes("VB2")) return;
             const p = l.split('#');
             const d = p[5].trim().split('.'); const t = p[6].trim().split(':');
-            if(d.length<3) return;
-            parsedTides.push({ time: new Date(parseInt(d[2]), parseInt(d[1])-1, parseInt(d[0]), parseInt(t[0]), parseInt(t[1])), type: p[3].trim() });
+            if (d.length < 3) return;
+            parsedTides.push({ time: new Date(parseInt(d[2]), parseInt(d[1]) - 1, parseInt(d[0]), parseInt(t[0]), parseInt(t[1])), type: p[3].trim() });
         });
-        parsedTides.sort((a,b)=>a.time-b.time);
-        
-        globalTides = parsedTides; // <--- HIER: GLOBAL SPEICHERN!
+        parsedTides.sort((a, b) => a.time - b.time);
+        globalTides = parsedTides;
 
-        // ... (Rest der Funktion mit next-hw Anzeige bleibt gleich)
-        const now = new Date(); 
+        const now = new Date();
         let next = parsedTides.find(e => e.time > now);
-        if(!next && parsedTides.length>0) next = parsedTides[0]; 
-        if(next) {
-             const hw = parsedTides.find(e => e.time >= next.time && e.type === 'H');
-             const nw = parsedTides.find(e => e.time >= next.time && e.type === 'N');
-             if(hw) document.getElementById('next-hw').innerText = hw.time.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-             if(nw) document.getElementById('next-nw').innerText = nw.time.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-             const diff = Math.round((next.time - now)/60000);
-             const diffText = `Noch ${Math.floor(diff/60)}h ${diff%60}m bis ${next.type==='H'?'HW':'NW'}`;
-             if (diff > 0) {
-                 document.getElementById('tide-count').innerText = diffText; // Das ist die kleine Karte rechts
-                 document.getElementById('val-tide-sub').innerText = diffText; // Das ist der Text unter "Aktuelle Tide"
-             }
+        if (!next && parsedTides.length > 0) next = parsedTides[0];
+        if (next) {
+            const hw = parsedTides.find(e => e.time >= next.time && e.type === 'H');
+            const nw = parsedTides.find(e => e.time >= next.time && e.type === 'N');
+            if (hw) setText('next-hw', hw.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+            if (nw) setText('next-nw', nw.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+            const diff = Math.round((next.time - now) / 60000);
+            const diffText = `Noch ${Math.floor(diff / 60)}h ${diff % 60}m bis ${next.type === 'H' ? 'HW' : 'NW'}`;
+            if (diff > 0) {
+                setText('tide-count', diffText);
+                setText('val-tide-sub', diffText);
             }
+        }
     }
 
-    // Ersetzt den nativen alert()
-    function showSysMsg(text, title="NAVIGATION") {
-        document.getElementById('sys-msg-text').innerText = text;
-        document.getElementById('sys-msg-title').innerText = title;
-        document.getElementById('sys-msg-overlay').style.display = 'flex';
+    // =============================================================
+    // UI HELFER
+    // =============================================================
+    function showSysMsg(text, title = "NAVIGATION") {
+        setText('sys-msg-text', text);
+        setText('sys-msg-title', title);
+        $('sys-msg-overlay').style.display = 'flex';
     }
 
     function closeSysMsg() {
-        document.getElementById('sys-msg-overlay').style.display = 'none';
+        $('sys-msg-overlay').style.display = 'none';
     }
-    
-    
-    // --- UI HELPERS ---
-    
-    // 0 = Dark (Default), 1 = Light (Day), 2 = Night (Red)
-    let currentTheme = 0; 
 
     function toggleFullscreen() {
         const doc = document.documentElement;
-        const btn = document.getElementById('btn-full');
-        
-        // Prüfen, ob wir schon im Vollbild sind
+        const btn = $('btn-full');
         const isFull = document.fullscreenElement || document.webkitFullscreenElement;
 
         if (!isFull) {
-            // Vollbild starten (mit Fallback für Safari/iOS 'webkit')
-            if (doc.requestFullscreen) {
-                doc.requestFullscreen();
-            } else if (doc.webkitRequestFullscreen) {
-                doc.webkitRequestFullscreen();
-            }
-            btn.classList.add('active'); // Button leuchten lassen
+            if (doc.requestFullscreen) doc.requestFullscreen();
+            else if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+            btn.classList.add('active');
         } else {
-            // Vollbild beenden
-            if (document.exitFullscreen) {
-                document.exitFullscreen();
-            } else if (document.webkitExitFullscreen) {
-                document.webkitExitFullscreen();
-            }
+            if (document.exitFullscreen) document.exitFullscreen();
+            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
             btn.classList.remove('active');
         }
     }
 
-    function toggleNight() { 
-        currentTheme = (currentTheme + 1) % 3; // Zyklus: 0 -> 1 -> 2 -> 0
-        const btn = document.getElementById('btn-night');
-        
-        // Reset classes
+    function toggleNight() {
+        currentTheme = (currentTheme + 1) % 3;
+        const btn = $('btn-night');
+
         document.body.classList.remove('night-mode', 'day-mode');
-        // Reset Textfarben (Default Weiss)
-        document.getElementById('turn-text').style.color = "#fff";
+        $('turn-text').style.color = "#fff";
 
         if (currentTheme === 0) {
-            // === MODUS 0: DARK (Standard) ===
             btn.innerText = "🌙";
-            btn.style.background = ""; 
+            btn.style.background = "";
             btn.style.color = "#fff";
             mapBaseLayer.setUrl('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png');
-        
         } else if (currentTheme === 1) {
-            // === MODUS 1: TAG (ESRI TOPO - BLUE WATER) ===
             document.body.classList.add('day-mode');
             btn.innerText = "☀️";
             btn.style.background = "#fbbf24";
             btn.style.color = "#000";
-            
-            document.getElementById('turn-text').style.color = "#0f172a"; 
-            
-            // ESRI WORLD TOPO MAP (Land: Grau, Wasser: Blau)
+            $('turn-text').style.color = "#0f172a";
             mapBaseLayer.setUrl('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}');
-        
         } else {
-            // === MODUS 2: NACHT (ROT) ===
             document.body.classList.add('night-mode');
             btn.innerText = "🔴";
             btn.style.background = "#300";
@@ -11976,216 +11723,170 @@ setInterval(loadPegelData, 5 * 60 * 1000);
         }
     }
 
-    function locateUser() { map.locate({setView: true, maxZoom: 15}); }
-    
+    function locateUser() { map.locate({ setView: true, maxZoom: 15 }); }
+
     function switchView(v, btn) {
-        // Alle Views ausblenden
         document.querySelectorAll('.view-section').forEach(e => e.classList.remove('active'));
-        
-        // Gewählten View einblenden
-        const viewEl = document.getElementById('view-'+v);
-        if(viewEl) viewEl.classList.add('active');
-        
-        // Nav-Buttons umschalten
+        const viewEl = $('view-' + v);
+        if (viewEl) viewEl.classList.add('active');
+
         document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
         btn.classList.add('active');
-        
-        // Spezial-Logik für bestimmte Views
-        if(v === 'map') setTimeout(()=>map.invalidateSize(), 200);
-        
-        // NEU: Wenn Schleusen-Tab, dann Liste neu berechnen/rendern
-        if(v === 'locks') renderLockList(); 
+
+        if (v === 'map') setTimeout(() => map.invalidateSize(), 200);
+        if (v === 'locks') renderLockList();
     }
-    
-    // SAR Logic
+
+    // =============================================================
+    // SAR (SUCHE & RETTUNG) - DRIFT-BERECHNUNG
+    // =============================================================
     function handleSarClick() {
-        if(sarRunning) {
+        if (sarRunning) {
             sarRunning = false; clearInterval(sarInt); routeLayer.clearLayers();
-            document.getElementById('btn-sar-main').innerText = "🚨";
-            document.getElementById('btn-sar-main').style.background = "var(--alert)";
+            $('btn-sar-main').innerText = "🚨";
+            $('btn-sar-main').style.background = "var(--alert)";
         } else {
             showSysMsg("Klicke jetzt auf die Karte, wo die Person zuletzt gesehen wurde.", "SAR EINSATZ");
             map.once('click', e => {
                 sarPt = e.latlng;
-                document.getElementById('sar-modal').style.display='block';
+                $('sar-modal').style.display = 'block';
             });
         }
     }
+
     function startSar() {
-        document.getElementById('sar-modal').style.display='none';
-        const min = parseInt(document.getElementById('sar-min').value);
+        $('sar-modal').style.display = 'none';
+        const min = parseInt($('sar-min').value);
         sarRunning = true;
         sarStart = new Date(new Date().getTime() - min * 60000);
-        document.getElementById('btn-sar-main').innerText = "BEENDEN";
-        document.getElementById('btn-sar-main').style.background = "#333";
+        $('btn-sar-main').innerText = "BEENDEN";
+        $('btn-sar-main').style.background = "#333";
         updateSar();
         sarInt = setInterval(updateSar, 60000);
     }
-    // --- UPDATED SAR LOGIK (Strikte Flussrichtung) ---
+
+    function closeModal() { $('sar-modal').style.display = 'none'; }
+
     function updateSar() {
-        if(!sarRunning || !sarPt || !sarStart) return;
+        if (!sarPt) return;
 
         const elapsedMin = (new Date() - sarStart) / 60000;
-        if(elapsedMin <= 0) return;
+        const driftSpeed = 0.2 + (Math.abs(trendDiff) / 100) * 1.5; // m/s, gleiche Formel wie Strömungsanzeige
+        const totalDistMeters = driftSpeed * elapsedMin * 60;
 
-        // 1. Strömung & Distanz
-        const flowSpeedMs = 0.2 + (Math.abs(trendDiff) * 0.05); 
-        const totalDistMeters = flowSpeedMs * 60 * elapsedMin;
-
-        // 2. Startknoten
         const startNodeId = findNearest(sarPt);
-        if(!startNodeId) return;
+        if (!startNodeId) return;
 
-        // 3. Fließrichtung bestimmen
-        // trendDiff < 0 = Ebbe (Wasser fließt nach Westen -> Longitude wird kleiner)
-        const isEbbe = trendDiff < 0; 
+        const isEbbe = trendDiff < 0;
 
-        let activePaths = []; 
-        
+        let activePaths = [];
         let queue = [{
             id: startNodeId,
             distSoFar: 0,
             pathPoints: [L.latLng(graph[startNodeId].lat, graph[startNodeId].lng)]
         }];
 
-        while(queue.length > 0) {
+        while (queue.length > 0) {
             let curr = queue.shift();
             let currNode = graph[curr.id];
 
-            // A) Distanzlimit erreicht?
-            if(curr.distSoFar >= totalDistMeters) {
+            if (curr.distSoFar >= totalDistMeters) {
                 activePaths.push(curr.pathPoints);
                 continue;
             }
 
             let foundNext = false;
 
-            // B) Nachbarn prüfen
             currNode.edges.forEach(edge => {
                 let neighborId = edge.target;
                 let neighborNode = graph[neighborId];
-                
-                // --- STRIKTE RICHTUNGSPRÜFUNG ---
+
                 let isDirectionCorrect = false;
-
-                if(isEbbe) {
-                    // EBBE: Ziel muss westlicher sein (kleinere Longitude)
-                    // +0.0002 Toleranz erlaubt minimale Abweichung für fast gerade Nord-Süd Kanäle
-                    if(neighborNode.lng <= currNode.lng + 0.0002) {
-                        isDirectionCorrect = true;
-                    }
+                if (isEbbe) {
+                    if (neighborNode.lng <= currNode.lng + 0.0002) isDirectionCorrect = true;
                 } else {
-                    // FLUT: Ziel muss östlicher sein (größere Longitude)
-                    if(neighborNode.lng >= currNode.lng - 0.0002) {
-                        isDirectionCorrect = true;
-                    }
+                    if (neighborNode.lng >= currNode.lng - 0.0002) isDirectionCorrect = true;
                 }
-                // --------------------------------
 
-                // Prüfen ob Knoten schon im aktuellen Pfad ist (Verhindert Rückwärtslaufen im Kreis)
                 const alreadyVisited = curr.pathPoints.some(p => p.lat === neighborNode.lat && p.lng === neighborNode.lng);
 
                 if (!alreadyVisited && isDirectionCorrect) {
                     foundNext = true;
-                    
                     let nextPt = L.latLng(neighborNode.lat, neighborNode.lng);
                     let newDist = curr.distSoFar + edge.dist;
-                    
-                    // Neuen Pfad abzweigen
                     let newPath = [...curr.pathPoints, nextPt];
-                    
-                    queue.push({
-                        id: neighborId,
-                        distSoFar: newDist,
-                        pathPoints: newPath
-                    });
+
+                    queue.push({ id: neighborId, distSoFar: newDist, pathPoints: newPath });
                 }
             });
 
-            // Wenn es hier nicht weitergeht (Sackgasse oder Ende des Graphen)
-            if(!foundNext) {
-                activePaths.push(curr.pathPoints);
-            }
+            if (!foundNext) activePaths.push(curr.pathPoints);
         }
 
-        // 5. Zeichnen
         routeLayer.clearLayers();
-        
-        // Gestrichelte Linie zum Einstiegspunkt
-        const startNodeLL = L.latLng(graph[startNodeId].lat, graph[startNodeId].lng);
-        L.polyline([sarPt, startNodeLL], {color: 'yellow', dashArray: '2,5', weight: 2}).addTo(routeLayer);
-        L.circleMarker(sarPt, {color: 'red', radius: 4}).bindPopup("Sichtung").addTo(routeLayer);
 
-        // Alle möglichen Drift-Pfade zeichnen
-        if(activePaths.length > 0) {
+        const startNodeLL = L.latLng(graph[startNodeId].lat, graph[startNodeId].lng);
+        L.polyline([sarPt, startNodeLL], { color: 'yellow', dashArray: '2,5', weight: 2 }).addTo(routeLayer);
+        L.circleMarker(sarPt, { color: 'red', radius: 4 }).bindPopup("Sichtung").addTo(routeLayer);
+
+        if (activePaths.length > 0) {
             activePaths.forEach(pts => {
-                // Pfad zeichnen
-                L.polyline(pts, {color: '#facc15', weight: 6, opacity: 0.7}).addTo(routeLayer);
-                
-                // Suchradius am Ende jedes Pfades
-                let endPt = pts[pts.length-1];
-                let searchRadius = 50 + (elapsedMin * 10); 
-                
+                L.polyline(pts, { color: '#facc15', weight: 6, opacity: 0.7 }).addTo(routeLayer);
+                let endPt = pts[pts.length - 1];
+                let searchRadius = 50 + (elapsedMin * 10);
+
                 L.circle(endPt, {
                     color: '#facc15', weight: 1, fillColor: '#facc15', fillOpacity: 0.4, radius: searchRadius
                 }).bindPopup(`
                     <b>SUCHGEBIET</b><br>
                     Drift: ${Math.round(elapsedMin)} min<br>
-                    Distanz: ${(totalDistMeters/1000).toFixed(2)} km
+                    Distanz: ${(totalDistMeters / 1000).toFixed(2)} km
                 `).addTo(routeLayer);
             });
         } else {
-            // Fallback, falls gar keine Richtung passt (z.B. direkt an einer Kante)
-            L.circle(startNodeLL, {color:'orange', radius: 50}).addTo(routeLayer).bindPopup("Keine Drift möglich (Gegenströmung?)");
+            L.circle(startNodeLL, { color: 'orange', radius: 50 }).addTo(routeLayer).bindPopup("Keine Drift möglich (Gegenströmung?)");
         }
-        
-        document.getElementById('btn-sar-main').innerHTML = `⏳ ${Math.round(elapsedMin)} MIN<br><span style="font-size:0.7em">DRIFT: ${(totalDistMeters/1000).toFixed(2)} KM</span>`;
-    }
-    function closeModal() { document.getElementById('sar-modal').style.display='none'; }
 
+        $('btn-sar-main').innerHTML = `⏳ ${Math.round(elapsedMin)} MIN<br><span style="font-size:0.7em">DRIFT: ${(totalDistMeters / 1000).toFixed(2)} KM</span>`;
+    }
+
+    // =============================================================
+    // FLOTTE
+    // =============================================================
     function initFleet() {
-        const sel = document.getElementById('opt-boat');
+        const sel = $('opt-boat');
         sel.innerHTML = "";
-        
+
         fleetConfig.forEach((boat, index) => {
             const opt = document.createElement('option');
-            opt.value = index; // Wir nutzen den Index als Value
+            opt.value = index;
             opt.innerText = boat.name;
             sel.appendChild(opt);
         });
-        
-        // Standardwerte setzen (UI)
-        document.getElementById('opt-start').value = "berth";
+
+        $('opt-start').value = "berth";
         updateFleetSettings();
     }
 
     function updateFleetSettings() {
-        // 1. Boot holen
-        const boatIndex = document.getElementById('opt-boat').value;
+        const boatIndex = $('opt-boat').value;
         currentBoat = fleetConfig[boatIndex];
-        
-        // 2. Modus holen
-        const mode = document.getElementById('opt-start').value;
+
+        const mode = $('opt-start').value;
         startFromBerth = (mode === 'berth');
 
-        // 3. Info Text
-        const coords = waypoints[currentBoat.homeWp];
-        const info = startFromBerth 
-            ? `Startet von Anleger ${currentBoat.name}` 
+        const info = startFromBerth
+            ? `Startet von Anleger ${currentBoat.name}`
             : `Startet von deiner aktuellen GPS Position.`;
-            
-        document.getElementById('current-boat-info').innerText = info;
-        
-        // Optional: Home-Marker auf Karte zeichnen
+
+        $('current-boat-info').innerText = info;
         drawHomeMarker();
     }
 
-    let homeMarkerLayer = L.layerGroup(); // Muss noch zur map hinzugefügt werden! (siehe unten)
-
     function drawHomeMarker() {
-        if(!map) return;
+        if (!map) return;
         homeMarkerLayer.clearLayers();
-        if(startFromBerth && waypoints[currentBoat.homeWp]) {
+        if (startFromBerth && waypoints[currentBoat.homeWp]) {
             const ll = waypoints[currentBoat.homeWp];
             const marker = L.circleMarker(ll, {
                 color: '#facc15', radius: 6, fillOpacity: 0.2
@@ -12194,7 +11895,24 @@ setInterval(loadPegelData, 5 * 60 * 1000);
         }
     }
 
+    // Für die onclick="..."-Attribute im HTML global verfügbar machen:
+    window.toggleLockOverride = toggleLockOverride;
+    window.toggleLocks = toggleLocks;
+    window.toggleNavMode = toggleNavMode;
+    window.setNavType = setNavType;
+    window.cancelNavSetup = cancelNavSetup;
+    window.stopNavigation = stopNavigation;
+    window.toggleAutoCenter = toggleAutoCenter;
+    window.toggleFlow = toggleFlow;
+    window.toggleFullscreen = toggleFullscreen;
+    window.toggleNight = toggleNight;
+    window.locateUser = locateUser;
+    window.switchView = switchView;
+    window.handleSarClick = handleSarClick;
+    window.startSar = startSar;
+    window.closeModal = closeModal;
+    window.closeSysMsg = closeSysMsg;
+    window.updateFleetSettings = updateFleetSettings;
     </script>
 </body>
 </html>
-
