@@ -135,6 +135,12 @@
             margin-top: 8px; width: 100%; border-radius: 4px; font-weight: bold; cursor: pointer; pointer-events: auto;
         }
 
+        #btn-change-dest {
+            background: transparent; color: var(--dim); border: 1px solid var(--border); padding: 8px 10px;
+            margin-top: 6px; width: 100%; border-radius: 4px; font-weight: bold; cursor: pointer; pointer-events: auto;
+            font-size: 0.85em;
+        }
+
         /* INFO CARDS */
         .info-container { padding: 20px; max-width: 600px; margin: 0 auto; }
         .data-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 15px; padding: 15px; }
@@ -237,6 +243,7 @@
                 --
             </div>
         </div>
+        <button id="btn-change-dest" onclick="changeDestination()">🎯 ZIEL ÄNDERN</button>
         <button id="btn-stop-nav" onclick="stopNavigation()">ROUTING BEENDEN</button>
     </div>
 
@@ -251,6 +258,7 @@
             <div id="btn-center" class="btn-fab active" onclick="toggleAutoCenter()">🎯</div>
             <div id="btn-flow" class="btn-fab active" onclick="toggleFlow()">🌊</div>
             <div id="btn-nav" class="btn-fab" onclick="toggleNavMode()">🧭</div>
+            <div id="btn-voice" class="btn-fab active" onclick="toggleVoice()">🔊</div>
             <div id="btn-sar-main" class="btn-fab" onclick="handleSarClick()">🚨</div>
             
         </div>
@@ -10782,6 +10790,14 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
     let nextWpIndex = 0;
     let navRouteNames = [];
     let isEmergency = false;
+    let navTarget = null;         // Ziel-Koordinate (für automatisches Rerouting nötig)
+    let navStartFromBerth = false; // war der Start ein Anleger-Start? (nötig fürs Rerouting)
+    let awaitingDestinationClick = false; // true NUR während der bewussten Zielauswahl - schützt vor versehentlichem Ändern der Route durch normale Kartenklicks
+    let offRouteStrikes = 0;      // Zähler, damit ein kurzer GPS-Ausreißer nicht sofort rerouted
+    let lastRerouteAt = 0;        // Timestamp der letzten Neuberechnung (Cooldown)
+    let lastAnnouncedText = "";   // zuletzt per Sprache angesagte Anweisung (Duplikate vermeiden)
+    let voiceEnabled = true;      // Sprachansagen an/aus
+    let navArrived = false;       // verhindert Mehrfach-Auslösung der Ankunftsmeldung
     let currentLevelNHN = -5.0;
     let globalTides = [];
 
@@ -11259,6 +11275,7 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
         $('nav-mode-overlay').style.display = 'none';
 
         navMode = true;
+        awaitingDestinationClick = true; // Kartenklick zählt jetzt bewusst als Zielsetzung
         const btn = $('btn-nav');
         btn.classList.add('active');
 
@@ -11289,7 +11306,7 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
             return;
         }
 
-        if (!navMode) return;
+        if (!navMode || !awaitingDestinationClick) return;
 
         let startPos = null;
         if (startFromBerth) {
@@ -11308,6 +11325,14 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
         navPath = result.path;
         navRouteNames = result.names;
         nextWpIndex = 1;
+
+        navTarget = e.latlng;
+        navStartFromBerth = startFromBerth;
+        offRouteStrikes = 0;
+        lastRerouteAt = Date.now();
+        lastAnnouncedText = "";
+        navArrived = false;
+        awaitingDestinationClick = false; // Ziel gesetzt - weitere Kartenklicks ändern jetzt NICHTS mehr
 
         routeLayer.clearLayers();
 
@@ -11338,6 +11363,11 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
         navMode = false;
         navPath = [];
         isEmergency = false;
+        navTarget = null;
+        offRouteStrikes = 0;
+        lastAnnouncedText = "";
+        navArrived = false;
+        awaitingDestinationClick = false;
 
         const btn = $('btn-nav');
         btn.classList.remove('active');
@@ -11350,6 +11380,20 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
         $('btn-center').classList.remove('active');
         $('map').style.transform = `translate(-50%, -50%) rotate(0deg)`;
         map.getContainer().style.cursor = '';
+    }
+
+    // Einziger Weg, ein bereits gesetztes Ziel zu ändern: bewusster
+    // Tastendruck + Bestätigungsdialog. Normale Kartenklicks während der
+    // Fahrt setzen NICHTS mehr, solange kein Ziel "scharf geschaltet" ist
+    // (siehe awaitingDestinationClick in onMapClick).
+    function changeDestination() {
+        if (!navMode) return;
+
+        awaitingDestinationClick = true;
+        map.getContainer().style.cursor = 'crosshair';
+        autoCenter = false;
+        $('btn-center').classList.remove('active');
+        showSysMsg("Klicke auf das NEUE Ziel auf der Karte.\nBis dahin bleibt die aktuelle Route aktiv.", "ZIEL ÄNDERN");
     }
 
     function toggleAutoCenter() {
@@ -11369,12 +11413,33 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
     function updateNavState() {
         if (navPath.length === 0 || nextWpIndex >= navPath.length) return;
 
-        const distToWp = map.distance(myPos, navPath[nextWpIndex]);
-        const distToTarget = map.distance(myPos, navPath[navPath.length - 1]);
+        let distToWp = map.distance(myPos, navPath[nextWpIndex]);
 
-        setText('hud-dist', (distToTarget / 1852).toFixed(2));
+        // Echte Restdistanz ENTLANG DER ROUTE (nicht die Luftlinie zum
+        // Ziel!) - erst so stimmen NM-Anzeige und ETA auch in kurvigen
+        // Fahrwassern.
+        let remainingDist = distToWp;
+        for (let i = nextWpIndex; i < navPath.length - 1; i++) {
+            remainingDist += map.distance(navPath[i], navPath[i + 1]);
+        }
+        setText('hud-dist', (remainingDist / 1852).toFixed(2));
         setText('hud-sog', currentSpeed.toFixed(1));
         setText('hud-cog', Math.round(boatHeading).toString().padStart(3, '0'));
+
+        // ETA: nur sinnvoll, wenn wir uns überhaupt bewegen
+        if (currentSpeed > 0.5) {
+            const secondsLeft = remainingDist / (currentSpeed * 0.514444); // kn -> m/s
+            const eta = new Date(Date.now() + secondsLeft * 1000);
+            setText('hud-eta', String(eta.getHours()).padStart(2, '0') + ':' + String(eta.getMinutes()).padStart(2, '0'));
+        } else {
+            setText('hud-eta', '--:--');
+        }
+
+        // Automatisches Rerouting, falls wir seitlich zu weit von der
+        // berechneten Route abgekommen sind (echtes Navi-Verhalten).
+        // Bricht bei Auslösung diesen Durchlauf ab - der nächste GPS-Fix
+        // arbeitet dann schon mit der neuen Route weiter.
+        if (checkOffRoute(distToWp)) return;
 
         let roadName = "";
         if (navRouteNames && navRouteNames[nextWpIndex - 1]) {
@@ -11404,11 +11469,12 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
         if (advanced) {
             nextWpIndex++;
             if (nextWpIndex >= navPath.length) {
-                setText('turn-text', "ZIEL ERREICHT");
-                setText('turn-arrow', "🏁");
-                setText('turn-street', "");
+                announceArrival();
                 return;
             }
+            // Distanz zum NEUEN nächsten Wegpunkt neu berechnen, statt mit
+            // dem veralteten Wert vom vorherigen Wegpunkt weiterzurechnen.
+            distToWp = map.distance(myPos, navPath[nextWpIndex]);
         }
 
         setText('turn-dist', Math.round(distToWp) + " m");
@@ -11423,23 +11489,150 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
             let diff = (b2 - b1 + 360) % 360;
             if (diff > 180) diff -= 360;
 
+            let instruction, arrow, color;
             if (diff > 25) {
-                setText('turn-text', "STEUERBORD");
-                $('turn-text').style.color = "#22c55e";
-                setText('turn-arrow', "↗️");
+                instruction = "STEUERBORD"; arrow = "↗️"; color = "#22c55e";
             } else if (diff < -25) {
-                setText('turn-text', "BACKBORD");
-                $('turn-text').style.color = "#ef4444";
-                setText('turn-arrow', "↖️");
+                instruction = "BACKBORD"; arrow = "↖️"; color = "#ef4444";
             } else {
-                setText('turn-text', "KURS HALTEN");
-                const isDay = document.body.classList.contains('day-mode');
-                $('turn-text').style.color = isDay ? "#0f172a" : "#fff";
-                setText('turn-arrow', "⬆️");
+                instruction = "KURS HALTEN"; arrow = "⬆️";
+                color = document.body.classList.contains('day-mode') ? "#0f172a" : "#fff";
             }
+
+            // Wie bei einem echten Navi: Abbiegehinweise vorher ankündigen
+            // ("IN 150 M STEUERBORD"), statt sie erst direkt am Wegpunkt
+            // anzuzeigen.
+            let displayText = instruction;
+            if (instruction !== "KURS HALTEN") {
+                displayText = distToWp > 60
+                    ? "IN " + Math.round(distToWp) + " M " + instruction
+                    : "JETZT " + instruction;
+            }
+
+            setText('turn-text', displayText);
+            $('turn-text').style.color = color;
+            setText('turn-arrow', arrow);
+
+            announceInstruction(instruction, distToWp);
         } else {
             setText('turn-text', "ZUM ZIEL");
             setText('turn-arrow', "🏁");
+        }
+    }
+
+    // =============================================================
+    // ECHTES NAVI-VERHALTEN: OFF-ROUTE-ERKENNUNG, REROUTING, ANSAGEN
+    // =============================================================
+
+    // Prüft den seitlichen Versatz zur aktuellen Route (Cross-Track-
+    // Distanz), nicht nur die Distanz zum nächsten Wegpunkt - sonst würde
+    // ein Abdriften entlang einer langen Geraden nie erkannt.
+    function checkOffRoute(distToWp) {
+        if (!map || navPath.length < 2 || nextWpIndex < 1 || navMode === false) return false;
+        if (!navTarget) return false; // kein Rerouting möglich ohne bekanntes Ziel (z.B. SAR-Layer)
+
+        const a = navPath[nextWpIndex - 1];
+        const b = navPath[nextWpIndex];
+        let crossTrack = distToWp;
+        try {
+            const closest = L.GeometryUtil.closestOnSegment(map, myPos, a, b);
+            crossTrack = map.distance(myPos, closest);
+        } catch (e) { /* Fallback: geradliniger Abstand zum Wegpunkt */ }
+
+        const OFF_ROUTE_THRESHOLD = 120;  // Meter seitlicher Versatz, ab dem neu geroutet wird
+        const STRIKES_NEEDED = 3;          // erst nach mehreren GPS-Fixes reagieren (kein Ausreißer-Reroute)
+        const REROUTE_COOLDOWN_MS = 15000; // Mindestabstand zwischen zwei automatischen Neuberechnungen
+
+        if (crossTrack > OFF_ROUTE_THRESHOLD) {
+            offRouteStrikes++;
+        } else {
+            offRouteStrikes = 0;
+        }
+
+        if (offRouteStrikes >= STRIKES_NEEDED && (Date.now() - lastRerouteAt) > REROUTE_COOLDOWN_MS) {
+            rerouteFromCurrentPosition();
+            return true;
+        }
+        return false;
+    }
+
+    // Berechnet die Route von der aktuellen Position neu zum ursprünglich
+    // gesetzten Ziel - z.B. nach Abdriften durch Strömung oder wenn der
+    // Kurs manuell verlassen wurde.
+    function rerouteFromCurrentPosition() {
+        if (!navTarget || !myPos) return;
+
+        showSysMsg("Fahrwasser verlassen - Route wird neu berechnet.", "NEUBERECHNUNG");
+
+        const result = calculateRoute(myPos, navTarget);
+        navPath = result.path;
+        navRouteNames = result.names;
+        nextWpIndex = 1;
+        navStartFromBerth = false; // ab jetzt geht es von der aktuellen Position weiter
+        offRouteStrikes = 0;
+        lastRerouteAt = Date.now();
+        lastAnnouncedText = "";
+
+        routeLayer.clearLayers();
+        L.polyline(navPath, { color: '#ef4444', weight: 6, opacity: 0.9 }).addTo(routeLayer);
+        L.circleMarker(navTarget, { color: '#ef4444', radius: 8 }).addTo(routeLayer);
+
+        speak("Route wird neu berechnet");
+    }
+
+    // Sprachansage per Web Speech API - fällt lautlos aus, wenn der
+    // Browser/das Gerät das nicht unterstützt oder der Nutzer es deaktiviert hat.
+    function speak(text) {
+        if (!voiceEnabled || !('speechSynthesis' in window)) return;
+        try {
+            window.speechSynthesis.cancel();
+            const u = new SpeechSynthesisUtterance(text);
+            u.lang = 'de-DE';
+            u.rate = 1.0;
+            window.speechSynthesis.speak(u);
+        } catch (e) { /* Sprachausgabe auf diesem Gerät nicht verfügbar */ }
+    }
+
+    // Kündigt Abbiegemanöver zweistufig an (auf Distanz + kurz vorher),
+    // ohne bei jedem GPS-Fix (~1x/Sek) erneut zu sprechen.
+    function announceInstruction(instruction, distToWp) {
+        if (instruction === "KURS HALTEN") { lastAnnouncedText = ""; return; }
+
+        let key = null;
+        if (distToWp <= 60) key = instruction + "_JETZT";
+        else if (distToWp <= 250) key = instruction + "_BALD";
+
+        if (key && key !== lastAnnouncedText) {
+            lastAnnouncedText = key;
+            const dir = instruction === "STEUERBORD" ? "Steuerbord" : "Backbord";
+            if (distToWp <= 60) speak("Jetzt " + dir);
+            else speak("In " + (Math.round(distToWp / 10) * 10) + " Metern " + dir);
+        }
+    }
+
+    function announceArrival() {
+        if (navArrived) return;
+        navArrived = true;
+        setText('turn-text', "ZIEL ERREICHT");
+        setText('turn-arrow', "🏁");
+        setText('turn-street', "");
+        setText('turn-dist', "0 m");
+        setText('hud-eta', "--:--");
+        showSysMsg("Du hast dein Ziel erreicht.", "ZIEL ERREICHT");
+        speak("Ziel erreicht");
+        if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+    }
+
+    function toggleVoice() {
+        voiceEnabled = !voiceEnabled;
+        const btn = $('btn-voice');
+        if (voiceEnabled) {
+            btn.classList.add('active');
+            btn.innerText = "🔊";
+        } else {
+            btn.classList.remove('active');
+            btn.innerText = "🔇";
+            if ('speechSynthesis' in window) window.speechSynthesis.cancel();
         }
     }
 
@@ -11914,9 +12107,11 @@ VB2#DE__508P# #H#Do#31.12.2026#22:16# 6.89 # #365#+ 1:00#  27171#   1#2461406.38
     window.toggleLockOverride = toggleLockOverride;
     window.toggleLocks = toggleLocks;
     window.toggleNavMode = toggleNavMode;
+    window.toggleVoice = toggleVoice;
     window.setNavType = setNavType;
     window.cancelNavSetup = cancelNavSetup;
     window.stopNavigation = stopNavigation;
+    window.changeDestination = changeDestination;
     window.toggleAutoCenter = toggleAutoCenter;
     window.toggleFlow = toggleFlow;
     window.toggleFullscreen = toggleFullscreen;
